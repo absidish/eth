@@ -14,83 +14,45 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
-// +build !deterministic
-
 package fetcher
 
 import (
-	"crypto/ecdsa"
 	"errors"
-	"fmt"
 	"math/big"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/ethereumproject/go-ethereum/common"
-	"github.com/ethereumproject/go-ethereum/core"
-	"github.com/ethereumproject/go-ethereum/core/state"
-	"github.com/ethereumproject/go-ethereum/core/types"
-	"github.com/ethereumproject/go-ethereum/crypto"
-	"github.com/ethereumproject/go-ethereum/ethdb"
-	"github.com/ethereumproject/go-ethereum/event"
-	"github.com/ethereumproject/go-ethereum/logger/glog"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/consensus/ethash"
+	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/params"
 )
 
 var (
-	testdb       ethdb.Database
-	testKey      *ecdsa.PrivateKey
-	testAddress  common.Address
-	genesis      *types.Block
-	unknownBlock = types.NewBlock(&types.Header{GasLimit: big.NewInt(4712388)}, nil, nil, nil)
+	testdb       = ethdb.NewMemDatabase()
+	testKey, _   = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
+	testAddress  = crypto.PubkeyToAddress(testKey.PublicKey)
+	genesis      = core.GenesisBlockForTesting(testdb, testAddress, big.NewInt(1000000000))
+	unknownBlock = types.NewBlock(&types.Header{GasLimit: params.GenesisGasLimit}, nil, nil, nil)
 )
-
-func init() {
-	glog.SetV(0)
-	glog.SetD(0)
-
-	var err error
-	testKey, err = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
-	if err != nil {
-		panic(err)
-	}
-	testAddress = crypto.PubkeyToAddress(testKey.PublicKey)
-
-	testdb, err = ethdb.NewMemDatabase()
-	if err != nil {
-		panic(err)
-	}
-
-	statedb, err := state.New(common.Hash{}, state.NewDatabase(testdb))
-	if err != nil {
-		panic(err)
-	}
-
-	obj := statedb.GetOrNewStateObject(testAddress)
-	obj.SetBalance(big.NewInt(1000000000))
-	root, err := statedb.CommitTo(testdb, false)
-	if err != nil {
-		panic(fmt.Sprintf("cannot write state: %v", err))
-	}
-	genesis = types.NewBlock(&types.Header{
-		Difficulty: big.NewInt(131072),
-		GasLimit:   big.NewInt(4712388),
-		Root:       root,
-	}, nil, nil, nil)
-}
 
 // makeChain creates a chain of n blocks starting at and including parent.
 // the returned hash chain is ordered head->parent. In addition, every 3rd block
 // contains a transaction and every 5th an uncle to allow testing correct block
 // reassembly.
 func makeChain(n int, seed byte, parent *types.Block) ([]common.Hash, map[common.Hash]*types.Block) {
-	blocks, _ := core.GenerateChain(core.DefaultConfigMorden.ChainConfig, parent, testdb, n, func(i int, block *core.BlockGen) {
+	blocks, _ := core.GenerateChain(params.TestChainConfig, parent, ethash.NewFaker(), testdb, n, func(i int, block *core.BlockGen) {
 		block.SetCoinbase(common.Address{seed})
 
 		// If the block number is multiple of 3, send a bonus transaction to the miner
 		if parent == genesis && i%3 == 0 {
-			tx, err := types.NewTransaction(block.TxNonce(testAddress), common.Address{seed}, big.NewInt(1000), core.TxGas, nil, nil).SignECDSA(testKey)
+			signer := types.MakeSigner(params.TestChainConfig, block.Number())
+			tx, err := types.SignTx(types.NewTransaction(block.TxNonce(testAddress), common.Address{seed}, big.NewInt(1000), params.TxGas, nil, nil), signer, testKey)
 			if err != nil {
 				panic(err)
 			}
@@ -130,7 +92,7 @@ func newTester() *fetcherTester {
 		blocks: map[common.Hash]*types.Block{genesis.Hash(): genesis},
 		drops:  make(map[string]bool),
 	}
-	tester.fetcher = New(new(event.TypeMux), tester.getBlock, tester.verifyHeader, tester.broadcastBlock, tester.chainHeight, tester.insertChain, tester.dropPeer)
+	tester.fetcher = New(tester.getBlock, tester.verifyHeader, tester.broadcastBlock, tester.chainHeight, tester.insertChain, tester.dropPeer)
 	tester.fetcher.Start()
 
 	return tester
@@ -162,28 +124,24 @@ func (f *fetcherTester) chainHeight() uint64 {
 }
 
 // insertChain injects a new blocks into the simulated chain.
-func (f *fetcherTester) insertChain(blocks types.Blocks) (res *core.ChainInsertResult) {
-	res = &core.ChainInsertResult{}
+func (f *fetcherTester) insertChain(blocks types.Blocks) (int, error) {
 	f.lock.Lock()
 	defer f.lock.Unlock()
 
 	for i, block := range blocks {
 		// Make sure the parent in known
 		if _, ok := f.blocks[block.ParentHash()]; !ok {
-			res.Index = i
-			res.Error = errors.New("unknown parent")
-			return
+			return i, errors.New("unknown parent")
 		}
 		// Discard any new blocks if the same height already exists
 		if block.NumberU64() <= f.blocks[f.hashes[len(f.hashes)-1]].NumberU64() {
-			res.Index = i
-			return
+			return i, nil
 		}
 		// Otherwise build our current chain
 		f.hashes = append(f.hashes, block.Hash())
 		f.blocks[block.Hash()] = block
 	}
-	return
+	return 0, nil
 }
 
 // dropPeer is an emulator for the peer removal, simply accumulating the various
@@ -539,7 +497,7 @@ func testImportDeduplication(t *testing.T, protocol int) {
 	bodyFetcher := tester.makeBodyFetcher("valid", blocks, 0)
 
 	counter := uint32(0)
-	tester.fetcher.insertChain = func(blocks types.Blocks) *core.ChainInsertResult {
+	tester.fetcher.insertChain = func(blocks types.Blocks) (int, error) {
 		atomic.AddUint32(&counter, uint32(len(blocks)))
 		return tester.insertChain(blocks)
 	}

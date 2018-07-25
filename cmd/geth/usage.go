@@ -20,7 +20,12 @@ package main
 
 import (
 	"io"
+	"sort"
 
+	"strings"
+
+	"github.com/ethereum/go-ethereum/cmd/utils"
+	"github.com/ethereum/go-ethereum/internal/debug"
 	"gopkg.in/urfave/cli.v1"
 )
 
@@ -28,202 +33,243 @@ import (
 var AppHelpTemplate = `NAME:
    {{.App.Name}} - {{.App.Usage}}
 
+   Copyright 2013-2018 The go-ethereum Authors
+
 USAGE:
-   {{.App.HelpName}} [options]{{if .App.Commands}} <command> [command options]{{end}} {{if .App.ArgsUsage}}{{.App.ArgsUsage}}{{else}}[arguments...]{{end}}
-
+   {{.App.HelpName}} [options]{{if .App.Commands}} command [command options]{{end}} {{if .App.ArgsUsage}}{{.App.ArgsUsage}}{{else}}[arguments...]{{end}}
+   {{if .App.Version}}
 VERSION:
-   {{.App.Version}}{{if .CommandAndFlagGroups}}
-
-COMMANDS AND FLAGS:
-
-{{range .CommandAndFlagGroups}}{{.Name}}
-------------------------------------------------------------------------
-  {{if .Commands}}{{range .Commands}}
-    {{join .Names ", "}}{{ "\t" }}{{.Usage}}{{ if .Subcommands }}{{ "\n\n" }}{{end}}{{range .Subcommands}}{{"\t"}}{{join .Names ", "}}{{ "\t" }}{{.Usage}}{{"\n"}}{{end}}{{end}}
-  
-  {{end}}{{range .Flags}}{{.}}
+   {{.App.Version}}
+   {{end}}{{if len .App.Authors}}
+AUTHOR(S):
+   {{range .App.Authors}}{{ . }}{{end}}
+   {{end}}{{if .App.Commands}}
+COMMANDS:
+   {{range .App.Commands}}{{join .Names ", "}}{{ "\t" }}{{.Usage}}
+   {{end}}{{end}}{{if .FlagGroups}}
+{{range .FlagGroups}}{{.Name}} OPTIONS:
+  {{range .Flags}}{{.}}
   {{end}}
 {{end}}{{end}}{{if .App.Copyright }}
-
 COPYRIGHT:
    {{.App.Copyright}}
    {{end}}
 `
 
-// flagGroup is a collection of commands and/or flags belonging to a single topic.
+// flagGroup is a collection of flags belonging to a single topic.
 type flagGroup struct {
-	Name     string
-	Flags    []cli.Flag
-	Commands []cli.Command
+	Name  string
+	Flags []cli.Flag
 }
 
-// AppHelpFlagAndCommandGroups is the application flags, grouped by functionality.
-var AppHelpFlagAndCommandGroups = []flagGroup{
+// AppHelpFlagGroups is the application flags, grouped by functionality.
+var AppHelpFlagGroups = []flagGroup{
 	{
 		Name: "ETHEREUM",
-		Commands: []cli.Command{
-			importCommand,
-			exportCommand,
-			dumpChainConfigCommand,
-			dumpCommand,
-			rollbackCommand,
-			recoverCommand,
-			resetCommand,
-		},
 		Flags: []cli.Flag{
-			DataDirFlag,
-			ChainIdentityFlag,
-			NetworkIdFlag,
-			DevModeFlag,
-			NodeNameFlag,
-			FastSyncFlag,
-			CacheFlag,
-			LightKDFFlag,
-			SputnikVMFlag,
-			BlockchainVersionFlag,
+			configFileFlag,
+			utils.DataDirFlag,
+			utils.KeyStoreDirFlag,
+			utils.NoUSBFlag,
+			utils.NetworkIdFlag,
+			utils.TestnetFlag,
+			utils.RinkebyFlag,
+			utils.SyncModeFlag,
+			utils.GCModeFlag,
+			utils.EthStatsURLFlag,
+			utils.IdentityFlag,
+			utils.LightServFlag,
+			utils.LightPeersFlag,
+			utils.LightKDFFlag,
+		},
+	},
+	{
+		Name: "DEVELOPER CHAIN",
+		Flags: []cli.Flag{
+			utils.DeveloperFlag,
+			utils.DeveloperPeriodFlag,
+		},
+	},
+	{
+		Name: "ETHASH",
+		Flags: []cli.Flag{
+			utils.EthashCacheDirFlag,
+			utils.EthashCachesInMemoryFlag,
+			utils.EthashCachesOnDiskFlag,
+			utils.EthashDatasetDirFlag,
+			utils.EthashDatasetsInMemoryFlag,
+			utils.EthashDatasetsOnDiskFlag,
+		},
+	},
+	//{
+	//	Name: "DASHBOARD",
+	//	Flags: []cli.Flag{
+	//		utils.DashboardEnabledFlag,
+	//		utils.DashboardAddrFlag,
+	//		utils.DashboardPortFlag,
+	//		utils.DashboardRefreshFlag,
+	//		utils.DashboardAssetsFlag,
+	//	},
+	//},
+	{
+		Name: "TRANSACTION POOL",
+		Flags: []cli.Flag{
+			utils.TxPoolNoLocalsFlag,
+			utils.TxPoolJournalFlag,
+			utils.TxPoolRejournalFlag,
+			utils.TxPoolPriceLimitFlag,
+			utils.TxPoolPriceBumpFlag,
+			utils.TxPoolAccountSlotsFlag,
+			utils.TxPoolGlobalSlotsFlag,
+			utils.TxPoolAccountQueueFlag,
+			utils.TxPoolGlobalQueueFlag,
+			utils.TxPoolLifetimeFlag,
+		},
+	},
+	{
+		Name: "PERFORMANCE TUNING",
+		Flags: []cli.Flag{
+			utils.CacheFlag,
+			utils.CacheDatabaseFlag,
+			utils.CacheGCFlag,
+			utils.TrieCacheGenFlag,
 		},
 	},
 	{
 		Name: "ACCOUNT",
-		Commands: []cli.Command{
-			accountCommand,
-			walletCommand,
-			buildAddrTxIndexCommand,
-		},
 		Flags: []cli.Flag{
-			KeyStoreDirFlag,
-			UnlockedAccountFlag,
-			PasswordFileFlag,
-			AccountsIndexFlag,
-			AddrTxIndexFlag,
-			AddrTxIndexAutoBuildFlag,
+			utils.UnlockedAccountFlag,
+			utils.PasswordFileFlag,
 		},
 	},
 	{
 		Name: "API AND CONSOLE",
-		Commands: []cli.Command{
-			consoleCommand,
-			attachCommand,
-			javascriptCommand,
-			apiCommand,
-		},
 		Flags: []cli.Flag{
-			RPCEnabledFlag,
-			RPCListenAddrFlag,
-			RPCPortFlag,
-			RPCApiFlag,
-			WSEnabledFlag,
-			WSListenAddrFlag,
-			WSPortFlag,
-			WSApiFlag,
-			WSAllowedOriginsFlag,
-			IPCDisabledFlag,
-			IPCApiFlag,
-			IPCPathFlag,
-			RPCCORSDomainFlag,
-			JSpathFlag,
-			ExecFlag,
-			PreloadJSFlag,
+			utils.RPCEnabledFlag,
+			utils.RPCListenAddrFlag,
+			utils.RPCPortFlag,
+			utils.RPCApiFlag,
+			utils.WSEnabledFlag,
+			utils.WSListenAddrFlag,
+			utils.WSPortFlag,
+			utils.WSApiFlag,
+			utils.WSAllowedOriginsFlag,
+			utils.IPCDisabledFlag,
+			utils.IPCPathFlag,
+			utils.RPCCORSDomainFlag,
+			utils.RPCVirtualHostsFlag,
+			utils.JSpathFlag,
+			utils.ExecFlag,
+			utils.PreloadJSFlag,
 		},
 	},
 	{
 		Name: "NETWORKING",
 		Flags: []cli.Flag{
-			BootnodesFlag,
-			ListenPortFlag,
-			MaxPeersFlag,
-			MaxPendingPeersFlag,
-			NATFlag,
-			NoDiscoverFlag,
-			NodeKeyFileFlag,
-			NodeKeyHexFlag,
+			utils.BootnodesFlag,
+			utils.BootnodesV4Flag,
+			utils.BootnodesV5Flag,
+			utils.ListenPortFlag,
+			utils.MaxPeersFlag,
+			utils.MaxPendingPeersFlag,
+			utils.NATFlag,
+			utils.NoDiscoverFlag,
+			utils.DiscoveryV5Flag,
+			utils.NetrestrictFlag,
+			utils.NodeKeyFileFlag,
+			utils.NodeKeyHexFlag,
 		},
 	},
 	{
 		Name: "MINER",
-		Commands: []cli.Command{
-			makeDagCommand,
-		},
 		Flags: []cli.Flag{
-			MiningEnabledFlag,
-			MinerThreadsFlag,
-			MiningGPUFlag,
-			AutoDAGFlag,
-			EtherbaseFlag,
-			TargetGasLimitFlag,
-			GasPriceFlag,
-			ExtraDataFlag,
+			utils.MiningEnabledFlag,
+			utils.MinerThreadsFlag,
+			utils.EtherbaseFlag,
+			utils.TargetGasLimitFlag,
+			utils.GasPriceFlag,
+			utils.ExtraDataFlag,
 		},
 	},
 	{
 		Name: "GAS PRICE ORACLE",
 		Flags: []cli.Flag{
-			GpoMinGasPriceFlag,
-			GpoMaxGasPriceFlag,
-			GpoFullBlockRatioFlag,
-			GpobaseStepDownFlag,
-			GpobaseStepUpFlag,
-			GpobaseCorrectionFactorFlag,
+			utils.GpoBlocksFlag,
+			utils.GpoPercentileFlag,
+		},
+	},
+	{
+		Name: "VIRTUAL MACHINE",
+		Flags: []cli.Flag{
+			utils.VMEnableDebugFlag,
 		},
 	},
 	{
 		Name: "LOGGING AND DEBUGGING",
-		Commands: []cli.Command{
-			versionCommand,
-			statusCommand,
-			monitorCommand,
-			makeMlogDocCommand,
-			gpuInfoCommand,
-			gpuBenchCommand,
-		},
+		Flags: append([]cli.Flag{
+			utils.FakePoWFlag,
+			utils.NoCompactionFlag,
+		}, debug.Flags...),
+	},
+	{
+		Name: "METRICS AND STATS",
 		Flags: []cli.Flag{
-			VerbosityFlag,
-			VModuleFlag,
-			LogDirFlag,
-			LogMaxSizeFlag,
-			LogMinSizeFlag,
-			LogMaxTotalSizeFlag,
-			LogIntervalFlag,
-			LogMaxAgeFlag,
-			LogCompressFlag,
-			LogStatusFlag,
-			DisplayFlag,
-			DisplayFormatFlag,
-			NeckbeardFlag,
-			MLogFlag,
-			MLogDirFlag,
-			MLogComponentsFlag,
-			BacktraceAtFlag,
-			MetricsFlag,
-			FakePoWFlag,
+			utils.MetricsEnabledFlag,
+			utils.MetricsEnableInfluxDBFlag,
+			utils.MetricsInfluxDBEndpointFlag,
+			utils.MetricsInfluxDBDatabaseFlag,
+			utils.MetricsInfluxDBUsernameFlag,
+			utils.MetricsInfluxDBPasswordFlag,
+			utils.MetricsInfluxDBHostTagFlag,
 		},
 	},
 	{
-		Name: "EXPERIMENTAL",
+		Name:  "WHISPER (EXPERIMENTAL)",
+		Flags: whisperFlags,
+	},
+	{
+		Name: "DEPRECATED",
 		Flags: []cli.Flag{
-			WhisperEnabledFlag,
-			NatspecEnabledFlag,
-			DisplayFlag,
-			DisplayFormatFlag,
-			NeckbeardFlag,
+			utils.FastSyncFlag,
+			utils.LightModeFlag,
 		},
 	},
 	{
-		Name: "LEGACY",
-		Commands: []cli.Command{
-			upgradedbCommand,
-		},
-		Flags: []cli.Flag{
-			TestNetFlag,
-			Unused1,
-		},
+		Name: "MISC",
 	},
-	{
-		Name: "MISCELLANEOUS",
-		Flags: []cli.Flag{
-			SolcPathFlag,
-		},
-	},
+}
+
+// byCategory sorts an array of flagGroup by Name in the order
+// defined in AppHelpFlagGroups.
+type byCategory []flagGroup
+
+func (a byCategory) Len() int      { return len(a) }
+func (a byCategory) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
+func (a byCategory) Less(i, j int) bool {
+	iCat, jCat := a[i].Name, a[j].Name
+	iIdx, jIdx := len(AppHelpFlagGroups), len(AppHelpFlagGroups) // ensure non categorized flags come last
+
+	for i, group := range AppHelpFlagGroups {
+		if iCat == group.Name {
+			iIdx = i
+		}
+		if jCat == group.Name {
+			jIdx = i
+		}
+	}
+
+	return iIdx < jIdx
+}
+
+func flagCategory(flag cli.Flag) string {
+	for _, category := range AppHelpFlagGroups {
+		for _, flg := range category.Flags {
+			if flg.GetName() == flag.GetName() {
+				return category.Name
+			}
+		}
+	}
+	return "MISC"
 }
 
 func init() {
@@ -232,16 +278,17 @@ func init() {
 
 	// Define a one shot struct to pass to the usage template
 	type helpData struct {
-		App                  interface{}
-		CommandAndFlagGroups []flagGroup
+		App        interface{}
+		FlagGroups []flagGroup
 	}
+
 	// Override the default app help printer, but only for the global app help
 	originalHelpPrinter := cli.HelpPrinter
 	cli.HelpPrinter = func(w io.Writer, tmpl string, data interface{}) {
 		if tmpl == AppHelpTemplate {
 			// Iterate over all the flags and add any uncategorized ones
 			categorized := make(map[string]struct{})
-			for _, group := range AppHelpFlagAndCommandGroups {
+			for _, group := range AppHelpFlagGroups {
 				for _, flag := range group.Flags {
 					categorized[flag.String()] = struct{}{}
 				}
@@ -249,21 +296,45 @@ func init() {
 			uncategorized := []cli.Flag{}
 			for _, flag := range data.(*cli.App).Flags {
 				if _, ok := categorized[flag.String()]; !ok {
+					if strings.HasPrefix(flag.GetName(), "dashboard") {
+						continue
+					}
 					uncategorized = append(uncategorized, flag)
 				}
 			}
 			if len(uncategorized) > 0 {
 				// Append all ungategorized options to the misc group
-				miscs := len(AppHelpFlagAndCommandGroups[len(AppHelpFlagAndCommandGroups)-1].Flags)
-				AppHelpFlagAndCommandGroups[len(AppHelpFlagAndCommandGroups)-1].Flags = append(AppHelpFlagAndCommandGroups[len(AppHelpFlagAndCommandGroups)-1].Flags, uncategorized...)
+				miscs := len(AppHelpFlagGroups[len(AppHelpFlagGroups)-1].Flags)
+				AppHelpFlagGroups[len(AppHelpFlagGroups)-1].Flags = append(AppHelpFlagGroups[len(AppHelpFlagGroups)-1].Flags, uncategorized...)
 
 				// Make sure they are removed afterwards
 				defer func() {
-					AppHelpFlagAndCommandGroups[len(AppHelpFlagAndCommandGroups)-1].Flags = AppHelpFlagAndCommandGroups[len(AppHelpFlagAndCommandGroups)-1].Flags[:miscs]
+					AppHelpFlagGroups[len(AppHelpFlagGroups)-1].Flags = AppHelpFlagGroups[len(AppHelpFlagGroups)-1].Flags[:miscs]
 				}()
 			}
 			// Render out custom usage screen
-			originalHelpPrinter(w, tmpl, helpData{data, AppHelpFlagAndCommandGroups})
+			originalHelpPrinter(w, tmpl, helpData{data, AppHelpFlagGroups})
+		} else if tmpl == utils.CommandHelpTemplate {
+			// Iterate over all command specific flags and categorize them
+			categorized := make(map[string][]cli.Flag)
+			for _, flag := range data.(cli.Command).Flags {
+				if _, ok := categorized[flag.String()]; !ok {
+					categorized[flagCategory(flag)] = append(categorized[flagCategory(flag)], flag)
+				}
+			}
+
+			// sort to get a stable ordering
+			sorted := make([]flagGroup, 0, len(categorized))
+			for cat, flgs := range categorized {
+				sorted = append(sorted, flagGroup{cat, flgs})
+			}
+			sort.Sort(byCategory(sorted))
+
+			// add sorted array to data and render with default printer
+			originalHelpPrinter(w, tmpl, map[string]interface{}{
+				"cmd":              data,
+				"categorizedFlags": sorted,
+			})
 		} else {
 			originalHelpPrinter(w, tmpl, data)
 		}

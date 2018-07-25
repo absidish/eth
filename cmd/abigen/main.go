@@ -24,36 +24,27 @@ import (
 	"os"
 	"strings"
 
-	"github.com/ethereumproject/go-ethereum/accounts/abi/bind"
-	"github.com/ethereumproject/go-ethereum/common/compiler"
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/common/compiler"
 )
 
-// Version is the application revision identifier. It can be set with the linker
-// as in: go build -ldflags "-X main.Version="`git describe --tags`
-var Version = "unknown"
-
 var (
-	abiFlag = flag.String("abi", "", "Path to the Ethereum contract ABI json to bind")
+	abiFlag = flag.String("abi", "", "Path to the Ethereum contract ABI json to bind, - for STDIN")
 	binFlag = flag.String("bin", "", "Path to the Ethereum contract bytecode (generate deploy method)")
-	typFlag = flag.String("type", "", "Go struct name for the binding (default = package name)")
+	typFlag = flag.String("type", "", "Struct name for the binding (default = package name)")
 
 	solFlag  = flag.String("sol", "", "Path to the Ethereum contract Solidity source to build and bind")
 	solcFlag = flag.String("solc", "solc", "Solidity compiler to use if source builds are requested")
 	excFlag  = flag.String("exc", "", "Comma separated types to exclude from binding")
 
-	pkgFlag     = flag.String("pkg", "", "Go package name to generate the binding into")
-	outFlag     = flag.String("out", "", "Output file for the generated binding (default = stdout)")
-	versionFlag = flag.Bool("version", false, "Prints the revision identifier and exit immediatily.")
+	pkgFlag  = flag.String("pkg", "", "Package name to generate the binding into")
+	outFlag  = flag.String("out", "", "Output file for the generated binding (default = stdout)")
+	langFlag = flag.String("lang", "go", "Destination language for the bindings (go, java, objc)")
 )
 
 func main() {
 	// Parse and ensure all needed inputs are specified
 	flag.Parse()
-
-	if *versionFlag {
-		fmt.Println("abigen version", Version)
-		os.Exit(0)
-	}
 
 	if *abiFlag == "" && *solFlag == "" {
 		fmt.Printf("No contract ABI (--abi) or Solidity source (--sol) specified\n")
@@ -63,7 +54,19 @@ func main() {
 		os.Exit(-1)
 	}
 	if *pkgFlag == "" {
-		fmt.Printf("No destination Go package specified (--pkg)\n")
+		fmt.Printf("No destination package specified (--pkg)\n")
+		os.Exit(-1)
+	}
+	var lang bind.Lang
+	switch *langFlag {
+	case "go":
+		lang = bind.LangGo
+	case "java":
+		lang = bind.LangJava
+	case "objc":
+		lang = bind.LangObjC
+	default:
+		fmt.Printf("Unsupported destination language \"%s\" (--lang)\n", *langFlag)
 		os.Exit(-1)
 	}
 	// If the entire solidity code was specified, build and bind based on that
@@ -72,27 +75,27 @@ func main() {
 		bins  []string
 		types []string
 	)
-	if *solFlag != "" {
+	if *solFlag != "" || *abiFlag == "-" {
 		// Generate the list of types to exclude from binding
 		exclude := make(map[string]bool)
 		for _, kind := range strings.Split(*excFlag, ",") {
 			exclude[strings.ToLower(kind)] = true
 		}
-		// Build the Solidity source into bindable components
-		solc, err := compiler.New(*solcFlag)
-		if err != nil {
-			fmt.Printf("Failed to locate Solidity compiler: %v\n", err)
-			os.Exit(-1)
-		}
-		source, err := ioutil.ReadFile(*solFlag)
-		if err != nil {
-			fmt.Printf("Failed to read Soldity source code: %v\n", err)
-			os.Exit(-1)
-		}
-		contracts, err := solc.Compile(string(source))
-		if err != nil {
-			fmt.Printf("Failed to build Solidity contract: %v\n", err)
-			os.Exit(-1)
+
+		var contracts map[string]*compiler.Contract
+		var err error
+		if *solFlag != "" {
+			contracts, err = compiler.CompileSolidity(*solcFlag, *solFlag)
+			if err != nil {
+				fmt.Printf("Failed to build Solidity contract: %v\n", err)
+				os.Exit(-1)
+			}
+		} else {
+			contracts, err = contractsFromStdin()
+			if err != nil {
+				fmt.Printf("Failed to read input ABIs from STDIN: %v\n", err)
+				os.Exit(-1)
+			}
 		}
 		// Gather all non-excluded contract for binding
 		for name, contract := range contracts {
@@ -102,7 +105,9 @@ func main() {
 			abi, _ := json.Marshal(contract.Info.AbiDefinition) // Flatten the compiler parse
 			abis = append(abis, string(abi))
 			bins = append(bins, contract.Code)
-			types = append(types, name)
+
+			nameParts := strings.Split(name, ":")
+			types = append(types, nameParts[len(nameParts)-1])
 		}
 	} else {
 		// Otherwise load up the ABI, optional bytecode and type name from the parameters
@@ -129,7 +134,7 @@ func main() {
 		types = append(types, kind)
 	}
 	// Generate the contract binding
-	code, err := bind.Bind(types, abis, bins, *pkgFlag)
+	code, err := bind.Bind(types, abis, bins, *pkgFlag, lang)
 	if err != nil {
 		fmt.Printf("Failed to generate ABI binding: %v\n", err)
 		os.Exit(-1)
@@ -143,4 +148,13 @@ func main() {
 		fmt.Printf("Failed to write ABI binding: %v\n", err)
 		os.Exit(-1)
 	}
+}
+
+func contractsFromStdin() (map[string]*compiler.Contract, error) {
+	bytes, err := ioutil.ReadAll(os.Stdin)
+	if err != nil {
+		return nil, err
+	}
+
+	return compiler.ParseCombinedJSON(bytes, "", "", "", "")
 }

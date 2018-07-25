@@ -22,19 +22,13 @@ import (
 	"net"
 	"reflect"
 	"testing"
-
-	"github.com/ethereumproject/go-ethereum/logger/glog"
+	"time"
 )
 
 type Service struct{}
 
 type Args struct {
 	S string
-}
-
-func init() {
-	glog.SetD(0)
-	glog.SetV(0)
 }
 
 func (s *Service) NoArgsRets() {
@@ -54,6 +48,13 @@ func (s *Service) EchoWithCtx(ctx context.Context, str string, i int, args *Args
 	return Result{str, i, args}
 }
 
+func (s *Service) Sleep(ctx context.Context, duration time.Duration) {
+	select {
+	case <-time.After(duration):
+	case <-ctx.Done():
+	}
+}
+
 func (s *Service) Rets() (string, error) {
 	return "", nil
 }
@@ -70,7 +71,7 @@ func (s *Service) InvalidRets3() (string, string, error) {
 	return "", "", nil
 }
 
-func (s *Service) Subscription(ctx context.Context) (Subscription, error) {
+func (s *Service) Subscription(ctx context.Context) (*Subscription, error) {
 	return nil, nil
 }
 
@@ -91,8 +92,8 @@ func TestServerRegisterName(t *testing.T) {
 		t.Fatalf("Expected service calc to be registered")
 	}
 
-	if len(svc.callbacks) != 4 {
-		t.Errorf("Expected 4 callbacks for service 'calc', got %d", len(svc.callbacks))
+	if len(svc.callbacks) != 5 {
+		t.Errorf("Expected 5 callbacks for service 'calc', got %d", len(svc.callbacks))
 	}
 
 	if len(svc.subscriptions) != 1 {
@@ -132,7 +133,7 @@ func testServerMethodExecution(t *testing.T, method string) {
 		t.Fatal(err)
 	}
 
-	response := JSONResponse{Result: &Result{}}
+	response := jsonSuccessResponse{Result: &Result{}}
 	if err := in.Decode(&response); err != nil {
 		t.Fatal(err)
 	}

@@ -22,10 +22,10 @@ import (
 	"io"
 	"io/ioutil"
 
-	"github.com/ethereumproject/go-ethereum/accounts"
-	"github.com/ethereumproject/go-ethereum/common"
-	"github.com/ethereumproject/go-ethereum/core/types"
-	"github.com/ethereumproject/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/accounts/keystore"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 )
 
 // NewTransactor is a utility method to easily create a transaction signer from
@@ -35,13 +35,11 @@ func NewTransactor(keyin io.Reader, passphrase string) (*TransactOpts, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	key, err := accounts.Web3PrivateKey(json, passphrase)
+	key, err := keystore.DecryptKey(json, passphrase)
 	if err != nil {
 		return nil, err
 	}
-
-	return NewKeyedTransactor(key), nil
+	return NewKeyedTransactor(key.PrivateKey), nil
 }
 
 // NewKeyedTransactor is a utility method to easily create a transaction signer
@@ -58,7 +56,7 @@ func NewKeyedTransactor(key *ecdsa.PrivateKey) *TransactOpts {
 			if err != nil {
 				return nil, err
 			}
-			return tx.WithSigner(signer).WithSignature(signature)
+			return tx.WithSignature(signer, signature)
 		},
 	}
 }

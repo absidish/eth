@@ -20,8 +20,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/ethereumproject/go-ethereum/common"
-	"github.com/ethereumproject/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/ethdb"
 	"gopkg.in/karalabe/cookiejar.v2/collections/prque"
 )
 
@@ -35,10 +35,9 @@ var ErrAlreadyProcessed = errors.New("already processed")
 
 // request represents a scheduled or already in-flight state retrieval request.
 type request struct {
-	hash   common.Hash // Hash of the node data content to retrieve
-	data   []byte      // Data content of the node, cached until all subtrees complete
-	object *node       // Target node to populate with retrieved data (hashnode originally)
-	raw    bool        // Whether this is a raw entry (code) or a trie node
+	hash common.Hash // Hash of the node data content to retrieve
+	data []byte      // Data content of the node, cached until all subtrees complete
+	raw  bool        // Whether this is a raw entry (code) or a trie node
 
 	parents []*request // Parent state nodes referencing this entry (notify all upon completion)
 	depth   int        // Depth level within the trie the node is located to prioritise DFS
@@ -57,7 +56,7 @@ type SyncResult struct {
 // syncMemBatch is an in-memory buffer of successfully downloaded but not yet
 // persisted data items.
 type syncMemBatch struct {
-	batch map[common.Hash][]byte // In-memory membatch of recently ocmpleted items
+	batch map[common.Hash][]byte // In-memory membatch of recently completed items
 	order []common.Hash          // Order of completion to prevent out-of-order data loss
 }
 
@@ -73,14 +72,14 @@ func newSyncMemBatch() *syncMemBatch {
 // unknown trie hashes to retrieve, accepts node data associated with said hashes
 // and reconstructs the trie step by step until all is done.
 type Sync struct {
-	database ethdb.Database           // Persistent database to check for existing entries
+	database DatabaseReader           // Persistent database to check for existing entries
 	membatch *syncMemBatch            // Memory buffer to avoid frequest database writes
 	requests map[common.Hash]*request // Pending requests pertaining to a key hash
 	queue    *prque.Prque             // Priority queue with the pending requests
 }
 
-// NewTrieSync creates a new trie data download scheduler.
-func NewTrieSync(root common.Hash, database ethdb.Database, callback LeafCallback) *Sync {
+// NewSync creates a new trie data download scheduler.
+func NewSync(root common.Hash, database DatabaseReader, callback LeafCallback) *Sync {
 	ts := &Sync{
 		database: database,
 		membatch: newSyncMemBatch(),
@@ -135,14 +134,14 @@ func (s *Sync) AddRawEntry(hash common.Hash, depth int, parent common.Hash) {
 	if _, ok := s.membatch.batch[hash]; ok {
 		return
 	}
-	if blob, _ := s.database.Get(hash.Bytes()); blob != nil {
+	if ok, _ := s.database.Has(hash.Bytes()); ok {
 		return
 	}
 	// Assemble the new sub-trie sync request
 	req := &request{
 		hash:  hash,
-		depth: depth,
 		raw:   true,
+		depth: depth,
 	}
 	// If this sub-trie has a designated parent, link them together
 	if parent != (common.Hash{}) {
@@ -213,8 +212,8 @@ func (s *Sync) Process(results []SyncResult) (bool, int, error) {
 }
 
 // Commit flushes the data stored in the internal membatch out to persistent
-// storage, returning th enumber of items written and any occurred error.
-func (s *Sync) Commit(dbw DatabaseWriter) (int, error) {
+// storage, returning the number of items written and any occurred error.
+func (s *Sync) Commit(dbw ethdb.Putter) (int, error) {
 	// Dump the membatch into a database dbw
 	for i, key := range s.membatch.order {
 		if err := dbw.Put(key[:], s.membatch.batch[key]); err != nil {

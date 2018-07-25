@@ -21,15 +21,20 @@ import (
 	"math/big"
 	"math/rand"
 	"testing"
+	"time"
 
-	"github.com/ethereumproject/go-ethereum/common"
-	"github.com/ethereumproject/go-ethereum/core"
-	"github.com/ethereumproject/go-ethereum/core/state"
-	"github.com/ethereumproject/go-ethereum/core/types"
-	"github.com/ethereumproject/go-ethereum/crypto"
-	"github.com/ethereumproject/go-ethereum/eth/downloader"
-	"github.com/ethereumproject/go-ethereum/ethdb"
-	"github.com/ethereumproject/go-ethereum/p2p"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/consensus/ethash"
+	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/eth/downloader"
+	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/p2p"
+	"github.com/ethereum/go-ethereum/params"
 )
 
 // Tests that protocol versions and modes of operations are matched up properly.
@@ -199,14 +204,11 @@ func testGetBlockHeaders(t *testing.T, protocol int) {
 		// Collect the headers to expect in the response
 		headers := []*types.Header{}
 		for _, hash := range tt.expect {
-			headers = append(headers, pm.blockchain.GetBlock(hash).Header())
+			headers = append(headers, pm.blockchain.GetBlockByHash(hash).Header())
 		}
 		// Send the hash request and verify the response
-		s, _ := p2p.Send(peer.app, GetBlockHeadersMsg, tt.query)
-		if s == 0 {
-			t.Errorf("got: %v, want: >0", s)
-		}
-		if err := p2p.ExpectMsg(peer.app, BlockHeadersMsg, headers); err != nil {
+		p2p.Send(peer.app, 0x03, tt.query)
+		if err := p2p.ExpectMsg(peer.app, 0x04, headers); err != nil {
 			t.Errorf("test %d: headers mismatch: %v", i, err)
 		}
 		// If the test used number origins, repeat with hashes as the too
@@ -214,11 +216,8 @@ func testGetBlockHeaders(t *testing.T, protocol int) {
 			if origin := pm.blockchain.GetBlockByNumber(tt.query.Origin.Number); origin != nil {
 				tt.query.Origin.Hash, tt.query.Origin.Number = origin.Hash(), 0
 
-				s, _ := p2p.Send(peer.app, GetBlockHeadersMsg, tt.query)
-				if s == 0 {
-					t.Errorf("got: %v, want: >0", s)
-				}
-				if err := p2p.ExpectMsg(peer.app, BlockHeadersMsg, headers); err != nil {
+				p2p.Send(peer.app, 0x03, tt.query)
+				if err := p2p.ExpectMsg(peer.app, 0x04, headers); err != nil {
 					t.Errorf("test %d: headers mismatch: %v", i, err)
 				}
 			}
@@ -286,16 +285,13 @@ func testGetBlockBodies(t *testing.T, protocol int) {
 		for j, hash := range tt.explicit {
 			hashes = append(hashes, hash)
 			if tt.available[j] && len(bodies) < tt.expected {
-				block := pm.blockchain.GetBlock(hash)
+				block := pm.blockchain.GetBlockByHash(hash)
 				bodies = append(bodies, &blockBody{Transactions: block.Transactions(), Uncles: block.Uncles()})
 			}
 		}
 		// Send the hash request and verify the response
-		s, _ := p2p.Send(peer.app, GetBlockBodiesMsg, hashes)
-		if s == 0 {
-			t.Errorf("got: %v, want: >0", s)
-		}
-		if err := p2p.ExpectMsg(peer.app, BlockBodiesMsg, bodies); err != nil {
+		p2p.Send(peer.app, 0x05, hashes)
+		if err := p2p.ExpectMsg(peer.app, 0x06, bodies); err != nil {
 			t.Errorf("test %d: bodies mismatch: %v", i, err)
 		}
 	}
@@ -311,18 +307,19 @@ func testGetNodeData(t *testing.T, protocol int) {
 	acc1Addr := crypto.PubkeyToAddress(acc1Key.PublicKey)
 	acc2Addr := crypto.PubkeyToAddress(acc2Key.PublicKey)
 
+	signer := types.HomesteadSigner{}
 	// Create a chain generator with some simple transactions (blatantly stolen from @fjl/chain_markets_test)
 	generator := func(i int, block *core.BlockGen) {
 		switch i {
 		case 0:
 			// In block 1, the test bank sends account #1 some ether.
-			tx, _ := types.NewTransaction(block.TxNonce(testBank.Address), acc1Addr, big.NewInt(10000), core.TxGas, nil, nil).SignECDSA(testBankKey)
+			tx, _ := types.SignTx(types.NewTransaction(block.TxNonce(testBank), acc1Addr, big.NewInt(10000), params.TxGas, nil, nil), signer, testBankKey)
 			block.AddTx(tx)
 		case 1:
 			// In block 2, the test bank sends some more ether to account #1.
 			// acc1Addr passes it on to account #2.
-			tx1, _ := types.NewTransaction(block.TxNonce(testBank.Address), acc1Addr, big.NewInt(1000), core.TxGas, nil, nil).SignECDSA(testBankKey)
-			tx2, _ := types.NewTransaction(block.TxNonce(acc1Addr), acc2Addr, big.NewInt(1000), core.TxGas, nil, nil).SignECDSA(acc1Key)
+			tx1, _ := types.SignTx(types.NewTransaction(block.TxNonce(testBank), acc1Addr, big.NewInt(1000), params.TxGas, nil, nil), signer, testBankKey)
+			tx2, _ := types.SignTx(types.NewTransaction(block.TxNonce(acc1Addr), acc2Addr, big.NewInt(1000), params.TxGas, nil, nil), signer, acc1Key)
 			block.AddTx(tx1)
 			block.AddTx(tx2)
 		case 2:
@@ -340,26 +337,23 @@ func testGetNodeData(t *testing.T, protocol int) {
 		}
 	}
 	// Assemble the test environment
-	pm, _ := newTestProtocolManagerMust(t, downloader.FullSync, 4, generator, nil)
+	pm, db := newTestProtocolManagerMust(t, downloader.FullSync, 4, generator, nil)
 	peer, _ := newTestPeer("peer", protocol, pm, true)
 	defer peer.close()
 
 	// Fetch for now the entire chain db
 	hashes := []common.Hash{}
-	for _, key := range pm.chaindb.(*ethdb.MemDatabase).Keys() {
+	for _, key := range db.Keys() {
 		if len(key) == len(common.Hash{}) {
 			hashes = append(hashes, common.BytesToHash(key))
 		}
 	}
-	s, _ := p2p.Send(peer.app, GetNodeDataMsg, hashes)
-	if s == 0 {
-		t.Errorf("got: %v, want: >0", s)
-	}
+	p2p.Send(peer.app, 0x0d, hashes)
 	msg, err := peer.app.ReadMsg()
 	if err != nil {
 		t.Fatalf("failed to read node data response: %v", err)
 	}
-	if msg.Code != NodeDataMsg {
+	if msg.Code != 0x0e {
 		t.Fatalf("response packet code mismatch: have %x, want %x", msg.Code, 0x0c)
 	}
 	var data [][]byte
@@ -372,11 +366,11 @@ func testGetNodeData(t *testing.T, protocol int) {
 			t.Errorf("data hash mismatch: have %x, want %x", hash, want)
 		}
 	}
-	statedb, _ := ethdb.NewMemDatabase()
+	statedb := ethdb.NewMemDatabase()
 	for i := 0; i < len(data); i++ {
 		statedb.Put(hashes[i].Bytes(), data[i])
 	}
-	accounts := []common.Address{testBank.Address, acc1Addr, acc2Addr}
+	accounts := []common.Address{testBank, acc1Addr, acc2Addr}
 	for i := uint64(0); i <= pm.blockchain.CurrentBlock().NumberU64(); i++ {
 		trie, _ := state.New(pm.blockchain.GetBlockByNumber(i).Root(), state.NewDatabase(statedb))
 
@@ -405,18 +399,19 @@ func testGetReceipt(t *testing.T, protocol int) {
 	acc1Addr := crypto.PubkeyToAddress(acc1Key.PublicKey)
 	acc2Addr := crypto.PubkeyToAddress(acc2Key.PublicKey)
 
+	signer := types.HomesteadSigner{}
 	// Create a chain generator with some simple transactions (blatantly stolen from @fjl/chain_markets_test)
 	generator := func(i int, block *core.BlockGen) {
 		switch i {
 		case 0:
 			// In block 1, the test bank sends account #1 some ether.
-			tx, _ := types.NewTransaction(block.TxNonce(testBank.Address), acc1Addr, big.NewInt(10000), core.TxGas, nil, nil).SignECDSA(testBankKey)
+			tx, _ := types.SignTx(types.NewTransaction(block.TxNonce(testBank), acc1Addr, big.NewInt(10000), params.TxGas, nil, nil), signer, testBankKey)
 			block.AddTx(tx)
 		case 1:
 			// In block 2, the test bank sends some more ether to account #1.
 			// acc1Addr passes it on to account #2.
-			tx1, _ := types.NewTransaction(block.TxNonce(testBank.Address), acc1Addr, big.NewInt(1000), core.TxGas, nil, nil).SignECDSA(testBankKey)
-			tx2, _ := types.NewTransaction(block.TxNonce(acc1Addr), acc2Addr, big.NewInt(1000), core.TxGas, nil, nil).SignECDSA(acc1Key)
+			tx1, _ := types.SignTx(types.NewTransaction(block.TxNonce(testBank), acc1Addr, big.NewInt(1000), params.TxGas, nil, nil), signer, testBankKey)
+			tx2, _ := types.SignTx(types.NewTransaction(block.TxNonce(acc1Addr), acc2Addr, big.NewInt(1000), params.TxGas, nil, nil), signer, acc1Key)
 			block.AddTx(tx1)
 			block.AddTx(tx2)
 		case 2:
@@ -444,14 +439,84 @@ func testGetReceipt(t *testing.T, protocol int) {
 		block := pm.blockchain.GetBlockByNumber(i)
 
 		hashes = append(hashes, block.Hash())
-		receipts = append(receipts, core.GetBlockReceipts(pm.chaindb, block.Hash()))
+		receipts = append(receipts, pm.blockchain.GetReceiptsByHash(block.Hash()))
 	}
 	// Send the hash request and verify the response
-	s, _ := p2p.Send(peer.app, GetReceiptsMsg, hashes)
-	if s <= 0 {
-		t.Errorf("got: %v, want: >0", s)
-	}
-	if err := p2p.ExpectMsg(peer.app, ReceiptsMsg, receipts); err != nil {
+	p2p.Send(peer.app, 0x0f, hashes)
+	if err := p2p.ExpectMsg(peer.app, 0x10, receipts); err != nil {
 		t.Errorf("receipts mismatch: %v", err)
+	}
+}
+
+// Tests that post eth protocol handshake, DAO fork-enabled clients also execute
+// a DAO "challenge" verifying each others' DAO fork headers to ensure they're on
+// compatible chains.
+func TestDAOChallengeNoVsNo(t *testing.T)       { testDAOChallenge(t, false, false, false) }
+func TestDAOChallengeNoVsPro(t *testing.T)      { testDAOChallenge(t, false, true, false) }
+func TestDAOChallengeProVsNo(t *testing.T)      { testDAOChallenge(t, true, false, false) }
+func TestDAOChallengeProVsPro(t *testing.T)     { testDAOChallenge(t, true, true, false) }
+func TestDAOChallengeNoVsTimeout(t *testing.T)  { testDAOChallenge(t, false, false, true) }
+func TestDAOChallengeProVsTimeout(t *testing.T) { testDAOChallenge(t, true, true, true) }
+
+func testDAOChallenge(t *testing.T, localForked, remoteForked bool, timeout bool) {
+	// Reduce the DAO handshake challenge timeout
+	if timeout {
+		defer func(old time.Duration) { daoChallengeTimeout = old }(daoChallengeTimeout)
+		daoChallengeTimeout = 500 * time.Millisecond
+	}
+	// Create a DAO aware protocol manager
+	var (
+		evmux         = new(event.TypeMux)
+		pow           = ethash.NewFaker()
+		db            = ethdb.NewMemDatabase()
+		config        = &params.ChainConfig{DAOForkBlock: big.NewInt(1), DAOForkSupport: localForked}
+		gspec         = &core.Genesis{Config: config}
+		genesis       = gspec.MustCommit(db)
+		blockchain, _ = core.NewBlockChain(db, nil, config, pow, vm.Config{})
+	)
+	pm, err := NewProtocolManager(config, downloader.FullSync, DefaultConfig.NetworkId, evmux, new(testTxPool), pow, blockchain, db)
+	if err != nil {
+		t.Fatalf("failed to start test protocol manager: %v", err)
+	}
+	pm.Start(1000)
+	defer pm.Stop()
+
+	// Connect a new peer and check that we receive the DAO challenge
+	peer, _ := newTestPeer("peer", eth63, pm, true)
+	defer peer.close()
+
+	challenge := &getBlockHeadersData{
+		Origin:  hashOrNumber{Number: config.DAOForkBlock.Uint64()},
+		Amount:  1,
+		Skip:    0,
+		Reverse: false,
+	}
+	if err := p2p.ExpectMsg(peer.app, GetBlockHeadersMsg, challenge); err != nil {
+		t.Fatalf("challenge mismatch: %v", err)
+	}
+	// Create a block to reply to the challenge if no timeout is simulated
+	if !timeout {
+		blocks, _ := core.GenerateChain(&params.ChainConfig{}, genesis, ethash.NewFaker(), db, 1, func(i int, block *core.BlockGen) {
+			if remoteForked {
+				block.SetExtra(params.DAOForkBlockExtra)
+			}
+		})
+		if err := p2p.Send(peer.app, BlockHeadersMsg, []*types.Header{blocks[0].Header()}); err != nil {
+			t.Fatalf("failed to answer challenge: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond) // Sleep to avoid the verification racing with the drops
+	} else {
+		// Otherwise wait until the test timeout passes
+		time.Sleep(daoChallengeTimeout + 500*time.Millisecond)
+	}
+	// Verify that depending on fork side, the remote peer is maintained or dropped
+	if localForked == remoteForked && !timeout {
+		if peers := pm.peers.Len(); peers != 1 {
+			t.Fatalf("peer count mismatch: have %d, want %d", peers, 1)
+		}
+	} else {
+		if peers := pm.peers.Len(); peers != 0 {
+			t.Fatalf("peer count mismatch: have %d, want %d", peers, 0)
+		}
 	}
 }

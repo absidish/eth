@@ -21,95 +21,116 @@ import (
 	"crypto/ecdsa"
 	"flag"
 	"fmt"
-	"log"
+	"net"
 	"os"
 
-	"github.com/ethereumproject/go-ethereum/crypto"
-	"github.com/ethereumproject/go-ethereum/logger/glog"
-	"github.com/ethereumproject/go-ethereum/p2p/discover"
-	"github.com/ethereumproject/go-ethereum/p2p/nat"
+	"github.com/ethereum/go-ethereum/cmd/utils"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/p2p/discover"
+	"github.com/ethereum/go-ethereum/p2p/discv5"
+	"github.com/ethereum/go-ethereum/p2p/nat"
+	"github.com/ethereum/go-ethereum/p2p/netutil"
 )
-
-// Version is the application revision identifier. It can be set with the linker
-// as in: go build -ldflags "-X main.Version="`git describe --tags`
-var Version = "unknown"
-
-var (
-	listenAddr  = flag.String("addr", ":30301", "listen address")
-	genKey      = flag.String("genkey", "", "generate a node key and quit")
-	nodeKeyFile = flag.String("nodekey", "", "private key filename")
-	nodeKeyHex  = flag.String("nodekeyhex", "", "private key as hex (for testing)")
-	natdesc     = flag.String("nat", "none", "port mapping mechanism (any|none|upnp|pmp|extip:<IP>)")
-	versionFlag = flag.Bool("version", false, "Prints the revision identifier and exit immediatily.")
-)
-
-// onlyDoGenKey exits 0 if successful.
-// It does the -genkey flag feature and that is all.
-func onlyDoGenKey() {
-	key, err := crypto.GenerateKey()
-	if err != nil {
-		log.Fatalf("could not generate key: %s", err)
-	}
-	f, e := os.Create(*genKey)
-	defer f.Close()
-	if e != nil {
-		log.Fatalf("coult not open genkey file: %v", e)
-	}
-	if _, err := crypto.WriteECDSAKey(f, key); err != nil {
-		log.Fatal(err)
-	}
-	os.Exit(0)
-}
 
 func main() {
-	flag.Var(glog.GetVerbosity(), "verbosity", "log verbosity (0-9)")
-	flag.Var(glog.GetVModule(), "vmodule", "log verbosity pattern")
-	glog.SetToStderr(true)
+	var (
+		listenAddr  = flag.String("addr", ":30301", "listen address")
+		genKey      = flag.String("genkey", "", "generate a node key")
+		writeAddr   = flag.Bool("writeaddress", false, "write out the node's pubkey hash and quit")
+		nodeKeyFile = flag.String("nodekey", "", "private key filename")
+		nodeKeyHex  = flag.String("nodekeyhex", "", "private key as hex (for testing)")
+		natdesc     = flag.String("nat", "none", "port mapping mechanism (any|none|upnp|pmp|extip:<IP>)")
+		netrestrict = flag.String("netrestrict", "", "restrict network communication to the given IP networks (CIDR masks)")
+		runv5       = flag.Bool("v5", false, "run a v5 topic discovery bootnode")
+		verbosity   = flag.Int("verbosity", int(log.LvlInfo), "log verbosity (0-9)")
+		vmodule     = flag.String("vmodule", "", "log verbosity pattern")
+
+		nodeKey *ecdsa.PrivateKey
+		err     error
+	)
 	flag.Parse()
 
-	if *versionFlag {
-		fmt.Println("bootnode version", Version)
-		os.Exit(0)
-	}
-
-	if *genKey != "" {
-		// exits 0 if successful
-		onlyDoGenKey()
-	}
+	glogger := log.NewGlogHandler(log.StreamHandler(os.Stderr, log.TerminalFormat(false)))
+	glogger.Verbosity(log.Lvl(*verbosity))
+	glogger.Vmodule(*vmodule)
+	log.Root().SetHandler(glogger)
 
 	natm, err := nat.Parse(*natdesc)
 	if err != nil {
-		log.Fatalf("nat: %s", err)
+		utils.Fatalf("-nat: %v", err)
 	}
-
-	var nodeKey *ecdsa.PrivateKey
 	switch {
+	case *genKey != "":
+		nodeKey, err = crypto.GenerateKey()
+		if err != nil {
+			utils.Fatalf("could not generate key: %v", err)
+		}
+		if err = crypto.SaveECDSA(*genKey, nodeKey); err != nil {
+			utils.Fatalf("%v", err)
+		}
+		return
 	case *nodeKeyFile == "" && *nodeKeyHex == "":
-		log.Fatal("Use -nodekey or -nodekeyhex to specify a private key")
+		utils.Fatalf("Use -nodekey or -nodekeyhex to specify a private key")
 	case *nodeKeyFile != "" && *nodeKeyHex != "":
-		log.Fatal("Options -nodekey and -nodekeyhex are mutually exclusive")
+		utils.Fatalf("Options -nodekey and -nodekeyhex are mutually exclusive")
 	case *nodeKeyFile != "":
-		f, err := os.Open(*nodeKeyFile)
-		if err != nil {
-			log.Fatalf("error opening node key file: %v", err)
-		}
-		nodeKey, err = crypto.LoadECDSA(f)
-		if err := f.Close(); err != nil {
-			log.Fatalf("error closing key file: %v", err)
-		}
-		if err != nil {
-			log.Fatalf("nodekey: %s", err)
+		if nodeKey, err = crypto.LoadECDSA(*nodeKeyFile); err != nil {
+			utils.Fatalf("-nodekey: %v", err)
 		}
 	case *nodeKeyHex != "":
-		var err error
-		nodeKey, err = crypto.HexToECDSA(*nodeKeyHex)
-		if err != nil {
-			log.Fatalf("nodekeyhex: %s", err)
+		if nodeKey, err = crypto.HexToECDSA(*nodeKeyHex); err != nil {
+			utils.Fatalf("-nodekeyhex: %v", err)
 		}
 	}
 
-	if _, err := discover.ListenUDP(nodeKey, *listenAddr, natm, ""); err != nil {
-		log.Fatal(err)
+	if *writeAddr {
+		fmt.Printf("%v\n", discover.PubkeyID(&nodeKey.PublicKey))
+		os.Exit(0)
 	}
+
+	var restrictList *netutil.Netlist
+	if *netrestrict != "" {
+		restrictList, err = netutil.ParseNetlist(*netrestrict)
+		if err != nil {
+			utils.Fatalf("-netrestrict: %v", err)
+		}
+	}
+
+	addr, err := net.ResolveUDPAddr("udp", *listenAddr)
+	if err != nil {
+		utils.Fatalf("-ResolveUDPAddr: %v", err)
+	}
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		utils.Fatalf("-ListenUDP: %v", err)
+	}
+
+	realaddr := conn.LocalAddr().(*net.UDPAddr)
+	if natm != nil {
+		if !realaddr.IP.IsLoopback() {
+			go nat.Map(natm, nil, "udp", realaddr.Port, realaddr.Port, "ethereum discovery")
+		}
+		// TODO: react to external IP changes over time.
+		if ext, err := natm.ExternalIP(); err == nil {
+			realaddr = &net.UDPAddr{IP: ext, Port: realaddr.Port}
+		}
+	}
+
+	if *runv5 {
+		if _, err := discv5.ListenUDP(nodeKey, conn, realaddr, "", restrictList); err != nil {
+			utils.Fatalf("%v", err)
+		}
+	} else {
+		cfg := discover.Config{
+			PrivateKey:   nodeKey,
+			AnnounceAddr: realaddr,
+			NetRestrict:  restrictList,
+		}
+		if _, err := discover.ListenUDP(conn, cfg); err != nil {
+			utils.Fatalf("%v", err)
+		}
+	}
+
 	select {}
 }

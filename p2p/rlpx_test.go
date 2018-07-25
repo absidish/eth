@@ -31,11 +31,12 @@ import (
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
-	"github.com/ethereumproject/go-ethereum/crypto"
-	"github.com/ethereumproject/go-ethereum/crypto/ecies"
-	"github.com/ethereumproject/go-ethereum/crypto/sha3"
-	"github.com/ethereumproject/go-ethereum/p2p/discover"
-	"github.com/ethereumproject/go-ethereum/rlp"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/crypto/ecies"
+	"github.com/ethereum/go-ethereum/crypto/sha3"
+	"github.com/ethereum/go-ethereum/p2p/discover"
+	"github.com/ethereum/go-ethereum/p2p/simulations/pipes"
+	"github.com/ethereum/go-ethereum/rlp"
 )
 
 func TestSharedSecret(t *testing.T) {
@@ -156,14 +157,18 @@ func TestProtocolHandshake(t *testing.T) {
 		node1   = &discover.Node{ID: discover.PubkeyID(&prv1.PublicKey), IP: net.IP{5, 6, 7, 8}, TCP: 44}
 		hs1     = &protoHandshake{Version: 3, ID: node1.ID, Caps: []Cap{{"c", 1}, {"d", 3}}}
 
-		fd0, fd1 = net.Pipe()
-		wg       sync.WaitGroup
+		wg sync.WaitGroup
 	)
+
+	fd0, fd1, err := pipes.TCPPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		defer fd1.Close()
+		defer fd0.Close()
 		rlpx := newRLPX(fd0)
 		remid, err := rlpx.doEncHandshake(prv0, node1)
 		if err != nil {
@@ -281,7 +286,7 @@ ba628a4ba590cb43f7848f41c4382885
 `)
 
 	// Check WriteMsg. This puts a message into the buffer.
-	if _, err := Send(rw, 8, []uint{1, 2, 3, 4}); err != nil {
+	if err := Send(rw, 8, []uint{1, 2, 3, 4}); err != nil {
 		t.Fatalf("WriteMsg error: %v", err)
 	}
 	written := buf.Bytes()
@@ -353,7 +358,7 @@ func TestRLPXFrameRW(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		// write message into conn buffer
 		wmsg := []interface{}{"foo", "bar", strings.Repeat("test", i)}
-		_, err := Send(rw1, uint64(i), wmsg)
+		err := Send(rw1, uint64(i), wmsg)
 		if err != nil {
 			t.Fatalf("WriteMsg error (i=%d): %v", i, err)
 		}

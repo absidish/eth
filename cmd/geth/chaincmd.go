@@ -17,277 +17,452 @@
 package main
 
 import (
-	"bufio"
+	"encoding/json"
 	"fmt"
-	"log"
 	"os"
-	"path/filepath"
+	"runtime"
 	"strconv"
-	"strings"
+	"sync/atomic"
 	"time"
 
-	"github.com/ethereumproject/go-ethereum/common"
-	"github.com/ethereumproject/go-ethereum/core"
-	"github.com/ethereumproject/go-ethereum/core/state"
-	"github.com/ethereumproject/go-ethereum/core/types"
-	"github.com/ethereumproject/go-ethereum/logger/glog"
+	"github.com/ethereum/go-ethereum/cmd/utils"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/console"
+	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/eth/downloader"
+	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/trie"
+	"github.com/syndtr/goleveldb/leveldb/util"
 	"gopkg.in/urfave/cli.v1"
 )
 
 var (
+	initCommand = cli.Command{
+		Action:    utils.MigrateFlags(initGenesis),
+		Name:      "init",
+		Usage:     "Bootstrap and initialize a new genesis block",
+		ArgsUsage: "<genesisPath>",
+		Flags: []cli.Flag{
+			utils.DataDirFlag,
+			utils.LightModeFlag,
+		},
+		Category: "BLOCKCHAIN COMMANDS",
+		Description: `
+The init command initializes a new genesis block and definition for the network.
+This is a destructive action and changes the network in which you will be
+participating.
+
+It expects the genesis file as argument.`,
+	}
 	importCommand = cli.Command{
-		Action: importChain,
-		Name:   "import",
-		Usage:  `Import a blockchain file`,
+		Action:    utils.MigrateFlags(importChain),
+		Name:      "import",
+		Usage:     "Import a blockchain file",
+		ArgsUsage: "<filename> (<filename 2> ... <filename N>) ",
+		Flags: []cli.Flag{
+			utils.DataDirFlag,
+			utils.CacheFlag,
+			utils.LightModeFlag,
+			utils.GCModeFlag,
+			utils.CacheDatabaseFlag,
+			utils.CacheGCFlag,
+		},
+		Category: "BLOCKCHAIN COMMANDS",
+		Description: `
+The import command imports blocks from an RLP-encoded form. The form can be one file
+with several RLP-encoded blocks, or several files can be used.
+
+If only one file is used, import error will result in failure. If several files are used,
+processing will proceed even if an individual RLP-file import failure occurs.`,
 	}
 	exportCommand = cli.Command{
-		Action: exportChain,
-		Name:   "export",
-		Usage:  `Export blockchain into file`,
+		Action:    utils.MigrateFlags(exportChain),
+		Name:      "export",
+		Usage:     "Export blockchain into file",
+		ArgsUsage: "<filename> [<blockNumFirst> <blockNumLast>]",
+		Flags: []cli.Flag{
+			utils.DataDirFlag,
+			utils.CacheFlag,
+			utils.LightModeFlag,
+		},
+		Category: "BLOCKCHAIN COMMANDS",
 		Description: `
-	Requires a first argument of the file to write to.
-	Optional second and third arguments control the first and
-	last block to write. In this mode, the file will be appended
-	if already existing.
-		`,
+Requires a first argument of the file to write to.
+Optional second and third arguments control the first and
+last block to write. In this mode, the file will be appended
+if already existing.`,
 	}
-	upgradedbCommand = cli.Command{
-		Action:  upgradeDB,
-		Name:    "upgrade-db",
-		Aliases: []string{"upgradedb"},
-		Usage:   "Upgrade chainblock database",
+	importPreimagesCommand = cli.Command{
+		Action:    utils.MigrateFlags(importPreimages),
+		Name:      "import-preimages",
+		Usage:     "Import the preimage database from an RLP stream",
+		ArgsUsage: "<datafile>",
+		Flags: []cli.Flag{
+			utils.DataDirFlag,
+			utils.CacheFlag,
+			utils.LightModeFlag,
+		},
+		Category: "BLOCKCHAIN COMMANDS",
+		Description: `
+	The import-preimages command imports hash preimages from an RLP encoded stream.`,
+	}
+	exportPreimagesCommand = cli.Command{
+		Action:    utils.MigrateFlags(exportPreimages),
+		Name:      "export-preimages",
+		Usage:     "Export the preimage database into an RLP stream",
+		ArgsUsage: "<dumpfile>",
+		Flags: []cli.Flag{
+			utils.DataDirFlag,
+			utils.CacheFlag,
+			utils.LightModeFlag,
+		},
+		Category: "BLOCKCHAIN COMMANDS",
+		Description: `
+The export-preimages command export hash preimages to an RLP encoded stream`,
+	}
+	copydbCommand = cli.Command{
+		Action:    utils.MigrateFlags(copyDb),
+		Name:      "copydb",
+		Usage:     "Create a local chain from a target chaindata folder",
+		ArgsUsage: "<sourceChaindataDir>",
+		Flags: []cli.Flag{
+			utils.DataDirFlag,
+			utils.CacheFlag,
+			utils.SyncModeFlag,
+			utils.FakePoWFlag,
+			utils.TestnetFlag,
+			utils.RinkebyFlag,
+		},
+		Category: "BLOCKCHAIN COMMANDS",
+		Description: `
+The first argument must be the directory containing the blockchain to download from`,
+	}
+	removedbCommand = cli.Command{
+		Action:    utils.MigrateFlags(removeDB),
+		Name:      "removedb",
+		Usage:     "Remove blockchain and state databases",
+		ArgsUsage: " ",
+		Flags: []cli.Flag{
+			utils.DataDirFlag,
+			utils.LightModeFlag,
+		},
+		Category: "BLOCKCHAIN COMMANDS",
+		Description: `
+Remove blockchain and state databases`,
 	}
 	dumpCommand = cli.Command{
-		Action: dump,
-		Name:   "dump",
-		Usage:  `Dump a specific block from storage`,
+		Action:    utils.MigrateFlags(dump),
+		Name:      "dump",
+		Usage:     "Dump a specific block from storage",
+		ArgsUsage: "[<blockHash> | <blockNum>]...",
+		Flags: []cli.Flag{
+			utils.DataDirFlag,
+			utils.CacheFlag,
+			utils.LightModeFlag,
+		},
+		Category: "BLOCKCHAIN COMMANDS",
 		Description: `
-	The arguments are interpreted as block numbers or hashes.
-	Use "$ geth dump 0" to dump the genesis block.
-		`,
-	}
-	dumpChainConfigCommand = cli.Command{
-		Action:  dumpChainConfig,
-		Name:    "dump-chain-config",
-		Aliases: []string{"dumpchainconfig"},
-		Usage:   "Dump current chain configuration to JSON file [REQUIRED argument: filepath.json]",
-		Description: `
-	The dump external configuration command writes a JSON file containing pertinent configuration data for
-	the configuration of a chain database. It includes genesis block data as well as chain fork settings.
-		`,
-	}
-	rollbackCommand = cli.Command{
-		Action:  rollback,
-		Name:    "rollback",
-		Aliases: []string{"roll-back", "set-head", "sethead"},
-		Usage:   "Set current head for blockchain, purging antecedent blocks",
-		Description: `
-	Rollback set the current head block for block chain already in the database.
-	This is a destructive action, purging any block more recent than the index specified.
-	Syncing will require downloading contemporary block information from the index onwards.
-		`,
-	}
-	statusCommand = cli.Command{
-		Action: status,
-		Name:   "status",
-		Usage:  "Display the status of the current node",
-		Description: `
-	Show the status of the current configuration.
-		`,
-	}
-	resetCommand = cli.Command{
-		Action: resetChaindata,
-		Name:   "reset",
-		Usage:  "Reset (remove) the chain database",
-		Description: `
-		Reset does a hard reset of the entire chain database.
-		This is a drastic and irreversible command, and should be used with caution.
-		The command will require user confirmation before any action is taken.
-		`,
-	}
-	recoverCommand = cli.Command{
-		Action: recoverChaindata,
-		Name:   "recover",
-		Usage:  "Attempt blockchain data recovery in case of data corruption",
-		Description: `
-		Recover scans and health-checks all available blockchain data in order
-		to recover all consistent and healthy block data. It will remove invalid or
-		corrupt block data that may have been caused by hard killing, system failure,
-		space limitations, or attack.
-		`,
+The arguments are interpreted as block numbers or hashes.
+Use "ethereum dump 0" to dump the genesis block.`,
 	}
 )
 
-func importChain(ctx *cli.Context) error {
-	if len(ctx.Args()) != 1 {
-		log.Fatal("This command requires an argument.")
+// initGenesis will initialise the given JSON format genesis file and writes it as
+// the zero'd block (i.e. genesis) or will fail hard if it can't succeed.
+func initGenesis(ctx *cli.Context) error {
+	// Make sure we have a valid genesis JSON
+	genesisPath := ctx.Args().First()
+	if len(genesisPath) == 0 {
+		utils.Fatalf("Must supply path to genesis JSON file")
 	}
-	chain, chainDb := MakeChain(ctx)
-	start := time.Now()
-	err := ImportChain(chain, ctx.Args().First())
-	chainDb.Close()
+	file, err := os.Open(genesisPath)
 	if err != nil {
-		log.Fatal("Import error: ", err)
+		utils.Fatalf("Failed to read genesis file: %v", err)
 	}
-	fmt.Printf("Import done in %v", time.Since(start))
+	defer file.Close()
+
+	genesis := new(core.Genesis)
+	if err := json.NewDecoder(file).Decode(genesis); err != nil {
+		utils.Fatalf("invalid genesis file: %v", err)
+	}
+	// Open an initialise both full and light databases
+	stack := makeFullNode(ctx)
+	for _, name := range []string{"chaindata", "lightchaindata"} {
+		chaindb, err := stack.OpenDatabase(name, 0, 0)
+		if err != nil {
+			utils.Fatalf("Failed to open database: %v", err)
+		}
+		_, hash, err := core.SetupGenesisBlock(chaindb, genesis)
+		if err != nil {
+			utils.Fatalf("Failed to write genesis block: %v", err)
+		}
+		log.Info("Successfully wrote genesis state", "database", name, "hash", hash)
+	}
+	return nil
+}
+
+func importChain(ctx *cli.Context) error {
+	if len(ctx.Args()) < 1 {
+		utils.Fatalf("This command requires an argument.")
+	}
+	stack := makeFullNode(ctx)
+	chain, chainDb := utils.MakeChain(ctx, stack)
+	defer chainDb.Close()
+
+	// Start periodically gathering memory profiles
+	var peakMemAlloc, peakMemSys uint64
+	go func() {
+		stats := new(runtime.MemStats)
+		for {
+			runtime.ReadMemStats(stats)
+			if atomic.LoadUint64(&peakMemAlloc) < stats.Alloc {
+				atomic.StoreUint64(&peakMemAlloc, stats.Alloc)
+			}
+			if atomic.LoadUint64(&peakMemSys) < stats.Sys {
+				atomic.StoreUint64(&peakMemSys, stats.Sys)
+			}
+			time.Sleep(5 * time.Second)
+		}
+	}()
+	// Import the chain
+	start := time.Now()
+
+	if len(ctx.Args()) == 1 {
+		if err := utils.ImportChain(chain, ctx.Args().First()); err != nil {
+			log.Error("Import error", "err", err)
+		}
+	} else {
+		for _, arg := range ctx.Args() {
+			if err := utils.ImportChain(chain, arg); err != nil {
+				log.Error("Import error", "file", arg, "err", err)
+			}
+		}
+	}
+	chain.Stop()
+	fmt.Printf("Import done in %v.\n\n", time.Since(start))
+
+	// Output pre-compaction stats mostly to see the import trashing
+	db := chainDb.(*ethdb.LDBDatabase)
+
+	stats, err := db.LDB().GetProperty("leveldb.stats")
+	if err != nil {
+		utils.Fatalf("Failed to read database stats: %v", err)
+	}
+	fmt.Println(stats)
+
+	ioStats, err := db.LDB().GetProperty("leveldb.iostats")
+	if err != nil {
+		utils.Fatalf("Failed to read database iostats: %v", err)
+	}
+	fmt.Println(ioStats)
+
+	fmt.Printf("Trie cache misses:  %d\n", trie.CacheMisses())
+	fmt.Printf("Trie cache unloads: %d\n\n", trie.CacheUnloads())
+
+	// Print the memory statistics used by the importing
+	mem := new(runtime.MemStats)
+	runtime.ReadMemStats(mem)
+
+	fmt.Printf("Object memory: %.3f MB current, %.3f MB peak\n", float64(mem.Alloc)/1024/1024, float64(atomic.LoadUint64(&peakMemAlloc))/1024/1024)
+	fmt.Printf("System memory: %.3f MB current, %.3f MB peak\n", float64(mem.Sys)/1024/1024, float64(atomic.LoadUint64(&peakMemSys))/1024/1024)
+	fmt.Printf("Allocations:   %.3f million\n", float64(mem.Mallocs)/1000000)
+	fmt.Printf("GC pause:      %v\n\n", time.Duration(mem.PauseTotalNs))
+
+	if ctx.GlobalIsSet(utils.NoCompactionFlag.Name) {
+		return nil
+	}
+
+	// Compact the entire database to more accurately measure disk io and print the stats
+	start = time.Now()
+	fmt.Println("Compacting entire database...")
+	if err = db.LDB().CompactRange(util.Range{}); err != nil {
+		utils.Fatalf("Compaction failed: %v", err)
+	}
+	fmt.Printf("Compaction done in %v.\n\n", time.Since(start))
+
+	stats, err = db.LDB().GetProperty("leveldb.stats")
+	if err != nil {
+		utils.Fatalf("Failed to read database stats: %v", err)
+	}
+	fmt.Println(stats)
+
+	ioStats, err = db.LDB().GetProperty("leveldb.iostats")
+	if err != nil {
+		utils.Fatalf("Failed to read database iostats: %v", err)
+	}
+	fmt.Println(ioStats)
+
 	return nil
 }
 
 func exportChain(ctx *cli.Context) error {
 	if len(ctx.Args()) < 1 {
-		log.Fatal("This command requires an argument.")
+		utils.Fatalf("This command requires an argument.")
 	}
-	chain, _ := MakeChain(ctx)
+	stack := makeFullNode(ctx)
+	chain, _ := utils.MakeChain(ctx, stack)
 	start := time.Now()
 
+	var err error
 	fp := ctx.Args().First()
 	if len(ctx.Args()) < 3 {
-		if err := ExportChain(chain, fp); err != nil {
-			log.Fatal(err)
-		}
+		err = utils.ExportChain(chain, fp)
 	} else {
 		// This can be improved to allow for numbers larger than 9223372036854775807
-		first, err := strconv.ParseUint(ctx.Args().Get(1), 10, 64)
-		if err != nil {
-			log.Fatal("export paramater: ", err)
+		first, ferr := strconv.ParseInt(ctx.Args().Get(1), 10, 64)
+		last, lerr := strconv.ParseInt(ctx.Args().Get(2), 10, 64)
+		if ferr != nil || lerr != nil {
+			utils.Fatalf("Export error in parsing parameters: block number not an integer\n")
 		}
-		last, err := strconv.ParseUint(ctx.Args().Get(2), 10, 64)
-		if err != nil {
-			log.Fatal("export paramater: ", err)
+		if first < 0 || last < 0 {
+			utils.Fatalf("Export error: block number must be greater than 0\n")
 		}
-		if err = ExportAppendChain(chain, fp, first, last); err != nil {
-			log.Fatal(err)
-		}
+		err = utils.ExportAppendChain(chain, fp, uint64(first), uint64(last))
 	}
 
-	fmt.Printf("Export done in %v", time.Since(start))
-	return nil
-}
-
-func upgradeDB(ctx *cli.Context) error {
-	glog.Infoln("Upgrading blockchain database")
-
-	chain, chainDb := MakeChain(ctx)
-	bcVersion := core.GetBlockChainVersion(chainDb)
-	if bcVersion == 0 {
-		bcVersion = core.BlockChainVersion
-	}
-
-	// Export the current chain.
-	filename := fmt.Sprintf("blockchain_%d_%s.chain", bcVersion, time.Now().Format("20060102_150405"))
-	exportFile := filepath.Join(ctx.GlobalString(DataDirFlag.Name), filename)
-	if err := ExportChain(chain, exportFile); err != nil {
-		log.Fatal("Unable to export chain for reimport ", err)
-	}
-	chainDb.Close()
-	os.RemoveAll(filepath.Join(ctx.GlobalString(DataDirFlag.Name), "chaindata"))
-
-	// Import the chain file.
-	chain, chainDb = MakeChain(ctx)
-	core.WriteBlockChainVersion(chainDb, core.BlockChainVersion)
-	err := ImportChain(chain, exportFile)
-	chainDb.Close()
 	if err != nil {
-		log.Fatalf("Import error %v (a backup is made in %s, use the import command to import it)", err, exportFile)
-	} else {
-		os.Remove(exportFile)
-		glog.Infoln("Import finished")
+		utils.Fatalf("Export error: %v\n", err)
 	}
+	fmt.Printf("Export done in %v\n", time.Since(start))
 	return nil
 }
 
-// Original use allows n hashes|ints as space-separated arguments, dumping entire state for each block n[x].
-// $ geth dump [hash|num] [hash|num] ... [hash|num]
-// $ geth dump 0x234234234234233 42 43 0xlksdf234r23r234223
-//
-// Revised use allows n hashes|ints as comma-separated first argument and n addresses as comma-separated second argument,
-// dumping only state information for given addresses if they're present.
-// revised use: $ geth dump [hash|num],[hash|num],...,[hash|num] [address],[address],...,[address]
-//
-// Added unsorted/sorted dumping algorithms.
-// unsorted dump is used by default.
-// revised use: $ geth dump [sorted] [hash|num],[hash|num],...,[hash|num] [address],[address],...,[address]
+// importPreimages imports preimage data from the specified file.
+func importPreimages(ctx *cli.Context) error {
+	if len(ctx.Args()) < 1 {
+		utils.Fatalf("This command requires an argument.")
+	}
+	stack := makeFullNode(ctx)
+	diskdb := utils.MakeChainDatabase(ctx, stack).(*ethdb.LDBDatabase)
+
+	start := time.Now()
+	if err := utils.ImportPreimages(diskdb, ctx.Args().First()); err != nil {
+		utils.Fatalf("Export error: %v\n", err)
+	}
+	fmt.Printf("Export done in %v\n", time.Since(start))
+	return nil
+}
+
+// exportPreimages dumps the preimage data to specified json file in streaming way.
+func exportPreimages(ctx *cli.Context) error {
+	if len(ctx.Args()) < 1 {
+		utils.Fatalf("This command requires an argument.")
+	}
+	stack := makeFullNode(ctx)
+	diskdb := utils.MakeChainDatabase(ctx, stack).(*ethdb.LDBDatabase)
+
+	start := time.Now()
+	if err := utils.ExportPreimages(diskdb, ctx.Args().First()); err != nil {
+		utils.Fatalf("Export error: %v\n", err)
+	}
+	fmt.Printf("Export done in %v\n", time.Since(start))
+	return nil
+}
+
+func copyDb(ctx *cli.Context) error {
+	// Ensure we have a source chain directory to copy
+	if len(ctx.Args()) != 1 {
+		utils.Fatalf("Source chaindata directory path argument missing")
+	}
+	// Initialize a new chain for the running node to sync into
+	stack := makeFullNode(ctx)
+	chain, chainDb := utils.MakeChain(ctx, stack)
+
+	syncmode := *utils.GlobalTextMarshaler(ctx, utils.SyncModeFlag.Name).(*downloader.SyncMode)
+	dl := downloader.New(syncmode, chainDb, new(event.TypeMux), chain, nil, nil)
+
+	// Create a source peer to satisfy downloader requests from
+	db, err := ethdb.NewLDBDatabase(ctx.Args().First(), ctx.GlobalInt(utils.CacheFlag.Name), 256)
+	if err != nil {
+		return err
+	}
+	hc, err := core.NewHeaderChain(db, chain.Config(), chain.Engine(), func() bool { return false })
+	if err != nil {
+		return err
+	}
+	peer := downloader.NewFakePeer("local", db, hc, dl)
+	if err = dl.RegisterPeer("local", 63, peer); err != nil {
+		return err
+	}
+	// Synchronise with the simulated peer
+	start := time.Now()
+
+	currentHeader := hc.CurrentHeader()
+	if err = dl.Synchronise("local", currentHeader.Hash(), hc.GetTd(currentHeader.Hash(), currentHeader.Number.Uint64()), syncmode); err != nil {
+		return err
+	}
+	for dl.Synchronising() {
+		time.Sleep(10 * time.Millisecond)
+	}
+	fmt.Printf("Database copy done in %v\n", time.Since(start))
+
+	// Compact the entire database to remove any sync overhead
+	start = time.Now()
+	fmt.Println("Compacting entire database...")
+	if err = chainDb.(*ethdb.LDBDatabase).LDB().CompactRange(util.Range{}); err != nil {
+		utils.Fatalf("Compaction failed: %v", err)
+	}
+	fmt.Printf("Compaction done in %v.\n\n", time.Since(start))
+
+	return nil
+}
+
+func removeDB(ctx *cli.Context) error {
+	stack, _ := makeConfigNode(ctx)
+
+	for _, name := range []string{"chaindata", "lightchaindata"} {
+		// Ensure the database exists in the first place
+		logger := log.New("database", name)
+
+		dbdir := stack.ResolvePath(name)
+		if !common.FileExist(dbdir) {
+			logger.Info("Database doesn't exist, skipping", "path", dbdir)
+			continue
+		}
+		// Confirm removal and execute
+		fmt.Println(dbdir)
+		confirm, err := console.Stdin.PromptConfirm("Remove this database?")
+		switch {
+		case err != nil:
+			utils.Fatalf("%v", err)
+		case !confirm:
+			logger.Warn("Database deletion aborted")
+		default:
+			start := time.Now()
+			os.RemoveAll(dbdir)
+			logger.Info("Database successfully deleted", "elapsed", common.PrettyDuration(time.Since(start)))
+		}
+	}
+	return nil
+}
 
 func dump(ctx *cli.Context) error {
-
-	if ctx.NArg() == 0 {
-		return fmt.Errorf("%v: use: $ geth dump [blockHash|blockNum],[blockHash|blockNum] [[addressHex|addressPrefixedHex],[addressHex|addressPrefixedHex]]", ErrInvalidFlag)
-	}
-
-	firstArg := 0
-	sorted := ctx.Args()[0] == "sorted"
-	if sorted {
-		firstArg = 1
-	}
-
-	blocks := strings.Split(ctx.Args()[firstArg], ",")
-	addresses := []common.Address{}
-	argaddress := ""
-	if ctx.NArg() > firstArg+1 {
-		argaddress = ctx.Args()[firstArg+1]
-	}
-
-	if argaddress != "" {
-		argaddresses := strings.Split(argaddress, ",")
-		for _, a := range argaddresses {
-			addresses = append(addresses, common.HexToAddress(strings.TrimSpace(a)))
-		}
-	}
-
-	chain, chainDb := MakeChain(ctx)
-	defer chainDb.Close()
-
-	prefix := ""
-	indent := "    "
-
-	out := bufio.NewWriter(os.Stdout)
-
-	if len(blocks) > 1 {
-		prefix = indent
-		out.WriteString("[\n")
-	}
-
-	for n, b := range blocks {
-		b = strings.TrimSpace(b)
+	stack := makeFullNode(ctx)
+	chain, chainDb := utils.MakeChain(ctx, stack)
+	for _, arg := range ctx.Args() {
 		var block *types.Block
-		if hashish(b) {
-			block = chain.GetBlock(common.HexToHash(b))
+		if hashish(arg) {
+			block = chain.GetBlockByHash(common.HexToHash(arg))
 		} else {
-			num, _ := strconv.Atoi(b)
+			num, _ := strconv.Atoi(arg)
 			block = chain.GetBlockByNumber(uint64(num))
 		}
 		if block == nil {
-			out.WriteString("{}\n")
-			log.Fatal("block not found")
+			fmt.Println("{}")
+			utils.Fatalf("block not found")
 		} else {
 			state, err := state.New(block.Root(), state.NewDatabase(chainDb))
 			if err != nil {
-				return fmt.Errorf("could not create new state: %v", err)
+				utils.Fatalf("could not create new state: %v", err)
 			}
-
-			if n != 0 {
-				out.WriteString(",\n")
-			}
-
-			if sorted {
-				err = state.SortedDump(addresses, prefix, indent, out)
-			} else {
-				err = state.UnsortedDump(addresses, prefix, indent, out)
-			}
-
-			if err != nil {
-				return err
-			}
+			fmt.Printf("%s\n", state.Dump())
 		}
 	}
-
-	if len(blocks) > 1 {
-		out.WriteString("\n]")
-	}
-
-	out.WriteString("\n")
-	out.Flush()
-
+	chainDb.Close()
 	return nil
 }
 

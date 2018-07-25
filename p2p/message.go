@@ -25,7 +25,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ethereumproject/go-ethereum/rlp"
+	"github.com/ethereum/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/p2p/discover"
+	"github.com/ethereum/go-ethereum/rlp"
 )
 
 // Msg defines the structure of a p2p message.
@@ -86,13 +88,13 @@ type MsgReadWriter interface {
 }
 
 // Send writes an RLP-encoded message with the given code.
-// data should encode as an RLP list. It returns the size of the encoded data for logging purposes.
-func Send(w MsgWriter, msgcode uint64, data interface{}) (int, error) {
+// data should encode as an RLP list.
+func Send(w MsgWriter, msgcode uint64, data interface{}) error {
 	size, r, err := rlp.EncodeToReader(data)
 	if err != nil {
-		return size, err
+		return err
 	}
-	return size, w.WriteMsg(Msg{Code: msgcode, Size: uint32(size), Payload: r})
+	return w.WriteMsg(Msg{Code: msgcode, Size: uint32(size), Payload: r})
 }
 
 // SendItems writes an RLP with the given code and data elements.
@@ -104,9 +106,8 @@ func Send(w MsgWriter, msgcode uint64, data interface{}) (int, error) {
 //
 //    [e1, e2, e3]
 //
-func SendItems(w MsgWriter, msgcode uint64, elems ...interface{}) (err error) {
-	_, err = Send(w, msgcode, elems)
-	return
+func SendItems(w MsgWriter, msgcode uint64, elems ...interface{}) error {
+	return Send(w, msgcode, elems)
 }
 
 // eofSignal wraps a reader with eof signaling. the eof channel is
@@ -228,21 +229,84 @@ func ExpectMsg(r MsgReader, code uint64, content interface{}) error {
 	}
 	if content == nil {
 		return msg.Discard()
-	} else {
-		contentEnc, err := rlp.EncodeToBytes(content)
-		if err != nil {
-			panic("content encode error: " + err.Error())
-		}
-		if int(msg.Size) != len(contentEnc) {
-			return fmt.Errorf("message size mismatch: got %d, want %d", msg.Size, len(contentEnc))
-		}
-		actualContent, err := ioutil.ReadAll(msg.Payload)
-		if err != nil {
-			return err
-		}
-		if !bytes.Equal(actualContent, contentEnc) {
-			return fmt.Errorf("message payload mismatch:\ngot:  %x\nwant: %x", actualContent, contentEnc)
-		}
+	}
+	contentEnc, err := rlp.EncodeToBytes(content)
+	if err != nil {
+		panic("content encode error: " + err.Error())
+	}
+	if int(msg.Size) != len(contentEnc) {
+		return fmt.Errorf("message size mismatch: got %d, want %d", msg.Size, len(contentEnc))
+	}
+	actualContent, err := ioutil.ReadAll(msg.Payload)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(actualContent, contentEnc) {
+		return fmt.Errorf("message payload mismatch:\ngot:  %x\nwant: %x", actualContent, contentEnc)
+	}
+	return nil
+}
+
+// msgEventer wraps a MsgReadWriter and sends events whenever a message is sent
+// or received
+type msgEventer struct {
+	MsgReadWriter
+
+	feed     *event.Feed
+	peerID   discover.NodeID
+	Protocol string
+}
+
+// newMsgEventer returns a msgEventer which sends message events to the given
+// feed
+func newMsgEventer(rw MsgReadWriter, feed *event.Feed, peerID discover.NodeID, proto string) *msgEventer {
+	return &msgEventer{
+		MsgReadWriter: rw,
+		feed:          feed,
+		peerID:        peerID,
+		Protocol:      proto,
+	}
+}
+
+// ReadMsg reads a message from the underlying MsgReadWriter and emits a
+// "message received" event
+func (ev *msgEventer) ReadMsg() (Msg, error) {
+	msg, err := ev.MsgReadWriter.ReadMsg()
+	if err != nil {
+		return msg, err
+	}
+	ev.feed.Send(&PeerEvent{
+		Type:     PeerEventTypeMsgRecv,
+		Peer:     ev.peerID,
+		Protocol: ev.Protocol,
+		MsgCode:  &msg.Code,
+		MsgSize:  &msg.Size,
+	})
+	return msg, nil
+}
+
+// WriteMsg writes a message to the underlying MsgReadWriter and emits a
+// "message sent" event
+func (ev *msgEventer) WriteMsg(msg Msg) error {
+	err := ev.MsgReadWriter.WriteMsg(msg)
+	if err != nil {
+		return err
+	}
+	ev.feed.Send(&PeerEvent{
+		Type:     PeerEventTypeMsgSend,
+		Peer:     ev.peerID,
+		Protocol: ev.Protocol,
+		MsgCode:  &msg.Code,
+		MsgSize:  &msg.Size,
+	})
+	return nil
+}
+
+// Close closes the underlying MsgReadWriter if it implements the io.Closer
+// interface
+func (ev *msgEventer) Close() error {
+	if v, ok := ev.MsgReadWriter.(io.Closer); ok {
+		return v.Close()
 	}
 	return nil
 }

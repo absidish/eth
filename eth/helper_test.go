@@ -23,26 +23,27 @@ import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"math/big"
+	"sort"
 	"sync"
 	"testing"
 
-	"github.com/ethereumproject/go-ethereum/common"
-	"github.com/ethereumproject/go-ethereum/core"
-	"github.com/ethereumproject/go-ethereum/core/types"
-	"github.com/ethereumproject/go-ethereum/crypto"
-	"github.com/ethereumproject/go-ethereum/eth/downloader"
-	"github.com/ethereumproject/go-ethereum/ethdb"
-	"github.com/ethereumproject/go-ethereum/event"
-	"github.com/ethereumproject/go-ethereum/p2p"
-	"github.com/ethereumproject/go-ethereum/p2p/discover"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/consensus/ethash"
+	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/eth/downloader"
+	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/p2p"
+	"github.com/ethereum/go-ethereum/p2p/discover"
+	"github.com/ethereum/go-ethereum/params"
 )
 
 var (
 	testBankKey, _ = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
-	testBank       = core.GenesisAccount{
-		Address: crypto.PubkeyToAddress(testBankKey.PublicKey),
-		Balance: big.NewInt(1000000),
-	}
+	testBank       = crypto.PubkeyToAddress(testBankKey.PublicKey)
 )
 
 // newTestProtocolManager creates a new protocol manager for testing purposes,
@@ -50,27 +51,22 @@ var (
 // channels for different events.
 func newTestProtocolManager(mode downloader.SyncMode, blocks int, generator func(int, *core.BlockGen), newtx chan<- []*types.Transaction) (*ProtocolManager, *ethdb.MemDatabase, error) {
 	var (
-		evmux       = new(event.TypeMux)
-		pow         = new(core.FakePow)
-		db, _       = ethdb.NewMemDatabase()
-		genesis     = core.WriteGenesisBlockForTesting(db, testBank)
-		chainConfig = &core.ChainConfig{
-			Forks: []*core.Fork{
-				{
-					Name:  "Homestead",
-					Block: big.NewInt(0),
-				},
-			},
+		evmux  = new(event.TypeMux)
+		engine = ethash.NewFaker()
+		db     = ethdb.NewMemDatabase()
+		gspec  = &core.Genesis{
+			Config: params.TestChainConfig,
+			Alloc:  core.GenesisAlloc{testBank: {Balance: big.NewInt(1000000)}},
 		}
-		blockchain, _ = core.NewBlockChain(db, chainConfig, pow, evmux)
+		genesis       = gspec.MustCommit(db)
+		blockchain, _ = core.NewBlockChain(db, nil, gspec.Config, engine, vm.Config{})
 	)
-
-	chain, _ := core.GenerateChain(core.DefaultConfigMorden.ChainConfig, genesis, db, blocks, generator)
-	if res := blockchain.InsertChain(chain); res.Error != nil {
-		panic(res.Error)
+	chain, _ := core.GenerateChain(gspec.Config, genesis, ethash.NewFaker(), db, blocks, generator)
+	if _, err := blockchain.InsertChain(chain); err != nil {
+		panic(err)
 	}
 
-	pm, err := NewProtocolManager(chainConfig, mode, NetworkId, evmux, &testTxPool{added: newtx}, pow, blockchain, db)
+	pm, err := NewProtocolManager(gspec.Config, mode, DefaultConfig.NetworkId, evmux, &testTxPool{added: newtx}, engine, blockchain, db)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -99,9 +95,9 @@ type testTxPool struct {
 	lock sync.RWMutex // Protects the transaction pool
 }
 
-// AddTransactions appends a batch of transactions to the pool, and notifies any
+// AddRemotes appends a batch of transactions to the pool, and notifies any
 // listeners if the addition channel is non nil
-func (p *testTxPool) AddTransactions(txs []*types.Transaction) {
+func (p *testTxPool) AddRemotes(txs []*types.Transaction) []error {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
@@ -109,23 +105,33 @@ func (p *testTxPool) AddTransactions(txs []*types.Transaction) {
 	if p.added != nil {
 		p.added <- txs
 	}
+	return make([]error, len(txs))
 }
 
-// GetTransactions returns all the transactions known to the pool
-func (p *testTxPool) GetTransactions() types.Transactions {
+// Pending returns all the transactions known to the pool
+func (p *testTxPool) Pending() (map[common.Address]types.Transactions, error) {
 	p.lock.RLock()
 	defer p.lock.RUnlock()
 
-	txs := make([]*types.Transaction, len(p.pool))
-	copy(txs, p.pool)
+	batches := make(map[common.Address]types.Transactions)
+	for _, tx := range p.pool {
+		from, _ := types.Sender(types.HomesteadSigner{}, tx)
+		batches[from] = append(batches[from], tx)
+	}
+	for _, batch := range batches {
+		sort.Sort(types.TxByNonce(batch))
+	}
+	return batches, nil
+}
 
-	return txs
+func (p *testTxPool) SubscribeNewTxsEvent(ch chan<- core.NewTxsEvent) event.Subscription {
+	return p.txFeed.Subscribe(ch)
 }
 
 // newTestTransaction create a new dummy transaction.
 func newTestTransaction(from *ecdsa.PrivateKey, nonce uint64, datasize int) *types.Transaction {
-	tx := types.NewTransaction(nonce, common.Address{}, big.NewInt(0), big.NewInt(100000), big.NewInt(0), make([]byte, datasize))
-	tx, _ = tx.SignECDSA(from)
+	tx := types.NewTransaction(nonce, common.Address{}, big.NewInt(0), 100000, big.NewInt(0), make([]byte, datasize))
+	tx, _ = types.SignTx(tx, types.HomesteadSigner{}, from)
 	return tx
 }
 
@@ -160,8 +166,12 @@ func newTestPeer(name string, version int, pm *ProtocolManager, shake bool) (*te
 	tp := &testPeer{app: app, net: net, peer: peer}
 	// Execute any implicitly requested handshakes and return
 	if shake {
-		td, head, genesis := pm.blockchain.Status()
-		tp.handshake(nil, td, head, genesis)
+		var (
+			genesis = pm.blockchain.Genesis()
+			head    = pm.blockchain.CurrentHeader()
+			td      = pm.blockchain.GetTd(head.Hash(), head.Number.Uint64())
+		)
+		tp.handshake(nil, td, head.Hash(), genesis.Hash())
 	}
 	return tp, errc
 }
@@ -171,7 +181,7 @@ func newTestPeer(name string, version int, pm *ProtocolManager, shake bool) (*te
 func (p *testPeer) handshake(t *testing.T, td *big.Int, head common.Hash, genesis common.Hash) {
 	msg := &statusData{
 		ProtocolVersion: uint32(p.version),
-		NetworkId:       uint32(NetworkId),
+		NetworkId:       DefaultConfig.NetworkId,
 		TD:              td,
 		CurrentBlock:    head,
 		GenesisBlock:    genesis,
@@ -179,10 +189,8 @@ func (p *testPeer) handshake(t *testing.T, td *big.Int, head common.Hash, genesi
 	if err := p2p.ExpectMsg(p.app, StatusMsg, msg); err != nil {
 		t.Fatalf("status recv: %v", err)
 	}
-	if s, err := p2p.Send(p.app, StatusMsg, msg); err != nil {
+	if err := p2p.Send(p.app, StatusMsg, msg); err != nil {
 		t.Fatalf("status send: %v", err)
-	} else if s <= 0 {
-		t.Errorf("got: %v, want: >0", s)
 	}
 }
 

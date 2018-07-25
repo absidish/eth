@@ -22,29 +22,31 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ethereumproject/go-ethereum/common"
-	"github.com/ethereumproject/go-ethereum/core/types"
-	"github.com/ethereumproject/go-ethereum/crypto"
-	"github.com/ethereumproject/go-ethereum/eth/downloader"
-	"github.com/ethereumproject/go-ethereum/p2p"
-	"github.com/ethereumproject/go-ethereum/rlp"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/eth/downloader"
+	"github.com/ethereum/go-ethereum/p2p"
+	"github.com/ethereum/go-ethereum/rlp"
 )
 
 func init() {
-	// glog.SetToStderr(true)
-	// glog.SetV(6)
+	// log.Root().SetHandler(log.LvlFilterHandler(log.LvlTrace, log.StreamHandler(os.Stderr, log.TerminalFormat(false))))
 }
 
 var testAccount, _ = crypto.HexToECDSA("b71c71a67e1177ad4e901695e1b4b9ee17ae16c6668d313eac2f96dbcda3f291")
 
 // Tests that handshake failures are detected and reported correctly.
-func TestStatusMsgErrors61(t *testing.T) { testStatusMsgErrors(t, 61) }
 func TestStatusMsgErrors62(t *testing.T) { testStatusMsgErrors(t, 62) }
 func TestStatusMsgErrors63(t *testing.T) { testStatusMsgErrors(t, 63) }
 
 func testStatusMsgErrors(t *testing.T, protocol int) {
 	pm, _ := newTestProtocolManagerMust(t, downloader.FullSync, 0, nil, nil)
-	td, currentBlock, genesis := pm.blockchain.Status()
+	var (
+		genesis = pm.blockchain.Genesis()
+		head    = pm.blockchain.CurrentHeader()
+		td      = pm.blockchain.GetTd(head.Hash(), head.Number.Uint64())
+	)
 	defer pm.Stop()
 
 	tests := []struct {
@@ -57,16 +59,16 @@ func testStatusMsgErrors(t *testing.T, protocol int) {
 			wantError: errResp(ErrNoStatusMsg, "first msg has code 2 (!= 0)"),
 		},
 		{
-			code: StatusMsg, data: statusData{10, NetworkId, td, currentBlock, genesis},
+			code: StatusMsg, data: statusData{10, DefaultConfig.NetworkId, td, head.Hash(), genesis.Hash()},
 			wantError: errResp(ErrProtocolVersionMismatch, "10 (!= %d)", protocol),
 		},
 		{
-			code: StatusMsg, data: statusData{uint32(protocol), 999, td, currentBlock, genesis},
+			code: StatusMsg, data: statusData{uint32(protocol), 999, td, head.Hash(), genesis.Hash()},
 			wantError: errResp(ErrNetworkIdMismatch, "999 (!= 1)"),
 		},
 		{
-			code: StatusMsg, data: statusData{uint32(protocol), NetworkId, td, currentBlock, common.Hash{3}},
-			wantError: errResp(ErrGenesisBlockMismatch, "0300000000000000000000000000000000000000000000000000000000000000 (!= %x…)", genesis.Bytes()[:8]),
+			code: StatusMsg, data: statusData{uint32(protocol), DefaultConfig.NetworkId, td, head.Hash(), common.Hash{3}},
+			wantError: errResp(ErrGenesisBlockMismatch, "0300000000000000 (!= %x)", genesis.Hash().Bytes()[:8]),
 		},
 	}
 
@@ -84,30 +86,27 @@ func testStatusMsgErrors(t *testing.T, protocol int) {
 				t.Errorf("test %d: wrong error: got %q, want %q", i, err, test.wantError)
 			}
 		case <-time.After(2 * time.Second):
-			t.Errorf("protocol did not shut down withing 2 seconds")
+			t.Errorf("protocol did not shut down within 2 seconds")
 		}
 		p.close()
 	}
 }
 
 // This test checks that received transactions are added to the local pool.
-func TestRecvTransactions61(t *testing.T) { testRecvTransactions(t, 61) }
 func TestRecvTransactions62(t *testing.T) { testRecvTransactions(t, 62) }
 func TestRecvTransactions63(t *testing.T) { testRecvTransactions(t, 63) }
 
 func testRecvTransactions(t *testing.T, protocol int) {
 	txAdded := make(chan []*types.Transaction)
 	pm, _ := newTestProtocolManagerMust(t, downloader.FullSync, 0, nil, txAdded)
-	pm.acceptsTxs = 1 // mark synced to accept transactions
+	pm.acceptTxs = 1 // mark synced to accept transactions
 	p, _ := newTestPeer("peer", protocol, pm, true)
 	defer pm.Stop()
 	defer p.close()
 
 	tx := newTestTransaction(testAccount, 0, 0)
-	if s, err := p2p.Send(p.app, TxMsg, []interface{}{tx}); err != nil {
+	if err := p2p.Send(p.app, TxMsg, []interface{}{tx}); err != nil {
 		t.Fatalf("send error: %v", err)
-	} else if s <= 0 {
-		t.Errorf("got: %v, want: >0", s)
 	}
 	select {
 	case added := <-txAdded:
@@ -117,12 +116,11 @@ func testRecvTransactions(t *testing.T, protocol int) {
 			t.Errorf("added wrong tx hash: got %v, want %v", added[0].Hash(), tx.Hash())
 		}
 	case <-time.After(2 * time.Second):
-		t.Errorf("no TxPreEvent received within 2 seconds")
+		t.Errorf("no NewTxsEvent received within 2 seconds")
 	}
 }
 
 // This test checks that pending transactions are sent.
-func TestSendTransactions61(t *testing.T) { testSendTransactions(t, 61) }
 func TestSendTransactions62(t *testing.T) { testSendTransactions(t, 62) }
 func TestSendTransactions63(t *testing.T) { testSendTransactions(t, 63) }
 
@@ -136,7 +134,7 @@ func testSendTransactions(t *testing.T, protocol int) {
 	for nonce := range alltxs {
 		alltxs[nonce] = newTestTransaction(testAccount, uint64(nonce), txsize)
 	}
-	pm.txpool.AddTransactions(alltxs)
+	pm.txpool.AddRemotes(alltxs)
 
 	// Connect several peers. They should all receive the pending transactions.
 	var wg sync.WaitGroup

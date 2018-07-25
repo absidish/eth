@@ -65,6 +65,24 @@ func TestStreamKind(t *testing.T) {
 	}
 }
 
+func TestNewListStream(t *testing.T) {
+	ls := NewListStream(bytes.NewReader(unhex("0101010101")), 3)
+	if k, size, err := ls.Kind(); k != List || size != 3 || err != nil {
+		t.Errorf("Kind() returned (%v, %d, %v), expected (List, 3, nil)", k, size, err)
+	}
+	if size, err := ls.List(); size != 3 || err != nil {
+		t.Errorf("List() returned (%d, %v), expected (3, nil)", size, err)
+	}
+	for i := 0; i < 3; i++ {
+		if val, err := ls.Uint(); val != 1 || err != nil {
+			t.Errorf("Uint() returned (%d, %v), expected (1, nil)", val, err)
+		}
+	}
+	if err := ls.ListEnd(); err != nil {
+		t.Errorf("ListEnd() returned %v, expected (3, nil)", err)
+	}
+}
+
 func TestStreamErrors(t *testing.T) {
 	withoutInputLimit := func(b []byte) *Stream {
 		return NewStream(newPlainReader(b), 0)
@@ -238,16 +256,31 @@ func TestStreamList(t *testing.T) {
 }
 
 func TestStreamRaw(t *testing.T) {
-	s := NewStream(bytes.NewReader(unhex("C58401010101")), 0)
-	s.List()
-
-	want := unhex("8401010101")
-	raw, err := s.Raw()
-	if err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		input  string
+		output string
+	}{
+		{
+			"C58401010101",
+			"8401010101",
+		},
+		{
+			"F842B84001010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101",
+			"B84001010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101",
+		},
 	}
-	if !bytes.Equal(want, raw) {
-		t.Errorf("raw mismatch: got %x, want %x", raw, want)
+	for i, tt := range tests {
+		s := NewStream(bytes.NewReader(unhex(tt.input)), 0)
+		s.List()
+
+		want := unhex(tt.output)
+		raw, err := s.Raw()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(want, raw) {
+			t.Errorf("test %d: raw mismatch: got %x, want %x", i, raw, want)
+		}
 	}
 }
 
@@ -320,6 +353,12 @@ var (
 		big.NewInt(0xFFFF),
 	)
 )
+
+type hasIgnoredField struct {
+	A uint
+	B uint `rlp:"-"`
+	C uint
+}
 
 var decodeTests = []decodeTest{
 	// booleans
@@ -470,6 +509,13 @@ var decodeTests = []decodeTest{
 		input: "C101",
 		ptr:   new(tailRaw),
 		value: tailRaw{A: 1, Tail: []RawValue{}},
+	},
+
+	// struct tag "-"
+	{
+		input: "C20102",
+		ptr:   new(hasIgnoredField),
+		value: hasIgnoredField{A: 1, C: 2},
 	},
 
 	// RawValue

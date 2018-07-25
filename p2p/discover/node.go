@@ -23,40 +23,34 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"math/rand"
 	"net"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
-
 	"time"
 
-	"github.com/ethereumproject/go-ethereum/common"
-	"github.com/ethereumproject/go-ethereum/crypto"
-	"github.com/ethereumproject/go-ethereum/crypto/secp256k1"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/crypto/secp256k1"
 )
 
-const nodeIDBits = 512
+const NodeIDBits = 512
 
 // Node represents a host on the network.
 // The fields of Node may not be modified.
 type Node struct {
-	IP net.IP `json:"ip"` // len 4 for IPv4 or 16 for IPv6
-	// port numbers
-	UDP uint16 `json:"udp"`
-	TCP uint16 `json:"tcp"`
-	ID  NodeID `json:"node_id"` // the node's public key
+	IP       net.IP // len 4 for IPv4 or 16 for IPv6
+	UDP, TCP uint16 // port numbers
+	ID       NodeID // the node's public key
 
 	// This is a cached copy of sha3(ID) which is used for node
 	// distance calculations. This is part of Node in order to make it
 	// possible to write tests that need a node at a certain distance.
 	// In those tests, the content of sha will not actually correspond
 	// with ID.
-	sha common.Hash `json:"sha"`
-
-	// whether this node is currently being pinged in order to replace
-	// it in a bucket
-	contested bool `json:"contested"`
+	sha common.Hash
 
 	// Time when the node was added to the table.
 	addedAt time.Time
@@ -213,9 +207,28 @@ func MustParseNode(rawurl string) *Node {
 	return n
 }
 
+// MarshalText implements encoding.TextMarshaler.
+func (n *Node) MarshalText() ([]byte, error) {
+	return []byte(n.String()), nil
+}
+
+// UnmarshalText implements encoding.TextUnmarshaler.
+func (n *Node) UnmarshalText(text []byte) error {
+	dec, err := ParseNode(string(text))
+	if err == nil {
+		*n = *dec
+	}
+	return err
+}
+
 // NodeID is a unique identifier for each node.
 // The node identifier is a marshaled elliptic curve public key.
-type NodeID [nodeIDBits / 8]byte
+type NodeID [NodeIDBits / 8]byte
+
+// Bytes returns a byte slice representation of the NodeID
+func (n NodeID) Bytes() []byte {
+	return n[:]
+}
 
 // NodeID prints as a long hexadecimal number.
 func (n NodeID) String() string {
@@ -227,14 +240,51 @@ func (n NodeID) GoString() string {
 	return fmt.Sprintf("discover.HexID(\"%x\")", n[:])
 }
 
+// TerminalString returns a shortened hex string for terminal logging.
+func (n NodeID) TerminalString() string {
+	return hex.EncodeToString(n[:8])
+}
+
+// MarshalText implements the encoding.TextMarshaler interface.
+func (n NodeID) MarshalText() ([]byte, error) {
+	return []byte(hex.EncodeToString(n[:])), nil
+}
+
+// UnmarshalText implements the encoding.TextUnmarshaler interface.
+func (n *NodeID) UnmarshalText(text []byte) error {
+	id, err := HexID(string(text))
+	if err != nil {
+		return err
+	}
+	*n = id
+	return nil
+}
+
+// BytesID converts a byte slice to a NodeID
+func BytesID(b []byte) (NodeID, error) {
+	var id NodeID
+	if len(b) != len(id) {
+		return id, fmt.Errorf("wrong length, want %d bytes", len(id))
+	}
+	copy(id[:], b)
+	return id, nil
+}
+
+// MustBytesID converts a byte slice to a NodeID.
+// It panics if the byte slice is not a valid NodeID.
+func MustBytesID(b []byte) NodeID {
+	id, err := BytesID(b)
+	if err != nil {
+		panic(err)
+	}
+	return id
+}
+
 // HexID converts a hex string to a NodeID.
 // The string may be prefixed with 0x.
 func HexID(in string) (NodeID, error) {
-	if strings.HasPrefix(in, "0x") {
-		in = in[2:]
-	}
 	var id NodeID
-	b, err := hex.DecodeString(in)
+	b, err := hex.DecodeString(strings.TrimPrefix(in, "0x"))
 	if err != nil {
 		return id, err
 	} else if len(b) != len(id) {
@@ -268,7 +318,7 @@ func PubkeyID(pub *ecdsa.PublicKey) NodeID {
 // Pubkey returns the public key represented by the node ID.
 // It returns an error if the ID is not a point on the curve.
 func (id NodeID) Pubkey() (*ecdsa.PublicKey, error) {
-	p := &ecdsa.PublicKey{Curve: secp256k1.S256(), X: new(big.Int), Y: new(big.Int)}
+	p := &ecdsa.PublicKey{Curve: crypto.S256(), X: new(big.Int), Y: new(big.Int)}
 	half := len(id) / 2
 	p.X.SetBytes(id[:half])
 	p.Y.SetBytes(id[half:])
@@ -292,4 +342,91 @@ func recoverNodeID(hash, sig []byte) (id NodeID, err error) {
 		id[i] = pubkey[i+1]
 	}
 	return id, nil
+}
+
+// distcmp compares the distances a->target and b->target.
+// Returns -1 if a is closer to target, 1 if b is closer to target
+// and 0 if they are equal.
+func distcmp(target, a, b common.Hash) int {
+	for i := range target {
+		da := a[i] ^ target[i]
+		db := b[i] ^ target[i]
+		if da > db {
+			return 1
+		} else if da < db {
+			return -1
+		}
+	}
+	return 0
+}
+
+// table of leading zero counts for bytes [0..255]
+var lzcount = [256]int{
+	8, 7, 6, 6, 5, 5, 5, 5,
+	4, 4, 4, 4, 4, 4, 4, 4,
+	3, 3, 3, 3, 3, 3, 3, 3,
+	3, 3, 3, 3, 3, 3, 3, 3,
+	2, 2, 2, 2, 2, 2, 2, 2,
+	2, 2, 2, 2, 2, 2, 2, 2,
+	2, 2, 2, 2, 2, 2, 2, 2,
+	2, 2, 2, 2, 2, 2, 2, 2,
+	1, 1, 1, 1, 1, 1, 1, 1,
+	1, 1, 1, 1, 1, 1, 1, 1,
+	1, 1, 1, 1, 1, 1, 1, 1,
+	1, 1, 1, 1, 1, 1, 1, 1,
+	1, 1, 1, 1, 1, 1, 1, 1,
+	1, 1, 1, 1, 1, 1, 1, 1,
+	1, 1, 1, 1, 1, 1, 1, 1,
+	1, 1, 1, 1, 1, 1, 1, 1,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0, 0, 0,
+}
+
+// logdist returns the logarithmic distance between a and b, log2(a ^ b).
+func logdist(a, b common.Hash) int {
+	lz := 0
+	for i := range a {
+		x := a[i] ^ b[i]
+		if x == 0 {
+			lz += 8
+		} else {
+			lz += lzcount[x]
+			break
+		}
+	}
+	return len(a)*8 - lz
+}
+
+// hashAtDistance returns a random hash such that logdist(a, b) == n
+func hashAtDistance(a common.Hash, n int) (b common.Hash) {
+	if n == 0 {
+		return a
+	}
+	// flip bit at position n, fill the rest with random bits
+	b = a
+	pos := len(a) - n/8 - 1
+	bit := byte(0x01) << (byte(n%8) - 1)
+	if bit == 0 {
+		pos++
+		bit = 0x80
+	}
+	b[pos] = a[pos]&^bit | ^a[pos]&bit // TODO: randomize end bits
+	for i := pos + 1; i < len(a); i++ {
+		b[i] = byte(rand.Intn(255))
+	}
+	return b
 }

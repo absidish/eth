@@ -25,15 +25,12 @@ import (
 	"net"
 	"time"
 
-	"github.com/ethereumproject/go-ethereum/crypto"
-	"github.com/ethereumproject/go-ethereum/logger"
-	"github.com/ethereumproject/go-ethereum/logger/glog"
-	"github.com/ethereumproject/go-ethereum/p2p/distip"
-	"github.com/ethereumproject/go-ethereum/p2p/nat"
-	"github.com/ethereumproject/go-ethereum/rlp"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/p2p/nat"
+	"github.com/ethereum/go-ethereum/p2p/netutil"
+	"github.com/ethereum/go-ethereum/rlp"
 )
-
-const Version = 4
 
 // Errors
 var (
@@ -42,43 +39,9 @@ var (
 	errExpired          = errors.New("expired")
 	errUnsolicitedReply = errors.New("unsolicited reply")
 	errUnknownNode      = errors.New("unknown node")
-	errReservedAddress  = errors.New("reserved address neighbor from non-reserved source")
-	errInvalidIp        = errors.New("invalid ip")
 	errTimeout          = errors.New("RPC timeout")
 	errClockWarp        = errors.New("reply deadline too far in the future")
 	errClosed           = errors.New("socket closed")
-
-	// Note: golang/net.IP provides some similar functionality via #IsLinkLocalUnicast, ...Multicast, etc.
-	// I would rather duplicate the information in a unified and comprehensive system than
-	// patch-in with a couple available library methods.
-	// I expect many of these occasions will be very unlikely.
-	//
-	// IPv4
-	Ipv4ReservedRangeThis               = [2]net.IP{net.ParseIP("0.0.0.0"), net.ParseIP("0.255.255.255")}
-	Ipv4ReservedRangePrivateNetwork     = [2]net.IP{net.ParseIP("10.0.0.0"), net.ParseIP("10.255.255.255")}
-	ipv4ReservedRangeProviderSubscriber = [2]net.IP{net.ParseIP("100.64.0.0"), net.ParseIP("100.127.255.255")}
-	Ipv4ReservedRangeLoopback           = [2]net.IP{net.ParseIP("127.0.0.0"), net.ParseIP("127.255.255.255")}
-	ipv4ReservedRangeLinkLocal          = [2]net.IP{net.ParseIP("169.254.0.0"), net.ParseIP("169.254.255.255")}
-	ipv4ReservedRangeLocalPrivate1      = [2]net.IP{net.ParseIP("172.16.0.0"), net.ParseIP("172.31.255.255")}
-	ipv4ReservedRangeSpecialPurpose     = [2]net.IP{net.ParseIP("192.0.0.0"), net.ParseIP("192.0.0.255")}
-	ipv4ReservedRangeTestNet1           = [2]net.IP{net.ParseIP("192.0.2.0"), net.ParseIP("192.0.2.255")}
-	ipv4ReservedRange6to4               = [2]net.IP{net.ParseIP("192.88.99.0"), net.ParseIP("192.88.99.255")}
-	Ipv4ReservedRangeLocalPrivate2      = [2]net.IP{net.ParseIP("192.168.0.0"), net.ParseIP("192.168.255.255")}
-	ipv4ReservedRangeSubnets            = [2]net.IP{net.ParseIP("198.18.0.0"), net.ParseIP("198.19.255.255")}
-	ipv4ReservedRangeTestNet2           = [2]net.IP{net.ParseIP("198.51.100.0"), net.ParseIP("198.51.100.255")}
-	ipv4ReservedRangeTestNet3           = [2]net.IP{net.ParseIP("203.0.113.0"), net.ParseIP("203.0.113.255")}
-	ipv4ReservedRangeMulticast          = [2]net.IP{net.ParseIP("224.0.0.0"), net.ParseIP("239.255.255.255")}
-	ipv4ReservedRangeFuture             = [2]net.IP{net.ParseIP("240.0.0.0"), net.ParseIP("255.255.255.254")}
-	ipv4ReservedRangeLimitedBroadcast   = [2]net.IP{net.ParseIP("255.255.255.255"), net.ParseIP("255.255.255.255")}
-
-	// IPv6
-	ipv6ReservedRangeUnspecified   = [2]net.IP{net.ParseIP("::"), net.ParseIP("::")}
-	Ipv6ReservedRangeLoopback      = [2]net.IP{net.ParseIP("::1"), net.ParseIP("::1")}
-	ipv6ReservedRangeDocumentation = [2]net.IP{net.ParseIP("2001:db8::"), net.ParseIP("2001:db8:ffff:ffff:ffff:ffff:ffff:ffff")}
-	ipv6ReservedRange6to4          = [2]net.IP{net.ParseIP("2002::"), net.ParseIP("2002:ffff:ffff:ffff:ffff:ffff:ffff:ffff")}
-	ipv6ReservedRangeUniqueLocal   = [2]net.IP{net.ParseIP("fc00::"), net.ParseIP("fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")}
-	ipv6ReservedRangeLinkLocal     = [2]net.IP{net.ParseIP("fe80::"), net.ParseIP("febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff")}
-	ipv6ReservedRangeMulticast     = [2]net.IP{net.ParseIP("ff00::"), net.ParseIP("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")}
 )
 
 // Timeouts
@@ -164,7 +127,7 @@ func (t *udp) nodeFromRPC(sender *net.UDPAddr, rn rpcNode) (*Node, error) {
 	if rn.UDP <= 1024 {
 		return nil, errors.New("low port")
 	}
-	if err := distip.CheckRelayIP(sender.IP, rn.IP); err != nil {
+	if err := netutil.CheckRelayIP(sender.IP, rn.IP); err != nil {
 		return nil, err
 	}
 	if t.netrestrict != nil && !t.netrestrict.Contains(rn.IP) {
@@ -181,6 +144,7 @@ func nodeToRPC(n *Node) rpcNode {
 
 type packet interface {
 	handle(t *udp, from *net.UDPAddr, fromID NodeID, mac []byte) error
+	name() string
 }
 
 type conn interface {
@@ -193,7 +157,7 @@ type conn interface {
 // udp implements the RPC protocol.
 type udp struct {
 	conn        conn
-	netrestrict *distip.Netlist
+	netrestrict *netutil.Netlist
 	priv        *ecdsa.PrivateKey
 	ourEndpoint rpcEndpoint
 
@@ -201,6 +165,7 @@ type udp struct {
 	gotreply   chan reply
 
 	closing chan struct{}
+	nat     nat.Interface
 
 	*Table
 }
@@ -242,54 +207,58 @@ type reply struct {
 	matched chan<- bool
 }
 
-// ListenUDP returns a new table that listens for UDP packets on laddr.
-func ListenUDP(priv *ecdsa.PrivateKey, laddr string, natm nat.Interface, nodeDBPath string) (*Table, error) {
-	addr, err := net.ResolveUDPAddr("udp", laddr)
-	if err != nil {
-		return nil, err
-	}
-	conn, err := net.ListenUDP("udp", addr)
-	if err != nil {
-		return nil, err
-	}
-	tab, _, err := newUDP(priv, conn, natm, nodeDBPath)
-	if err != nil {
-		return nil, err
-	}
-	glog.V(logger.Info).Infoln("Listening,", tab.self)
-	glog.D(logger.Warn).Infoln("UDP listening. Client enode:", logger.ColorGreen(tab.self.String()))
+// ReadPacket is sent to the unhandled channel when it could not be processed
+type ReadPacket struct {
+	Data []byte
+	Addr *net.UDPAddr
+}
 
+// Config holds Table-related settings.
+type Config struct {
+	// These settings are required and configure the UDP listener:
+	PrivateKey *ecdsa.PrivateKey
+
+	// These settings are optional:
+	AnnounceAddr *net.UDPAddr      // local address announced in the DHT
+	NodeDBPath   string            // if set, the node database is stored at this filesystem location
+	NetRestrict  *netutil.Netlist  // network whitelist
+	Bootnodes    []*Node           // list of bootstrap nodes
+	Unhandled    chan<- ReadPacket // unhandled packets are sent on this channel
+}
+
+// ListenUDP returns a new table that listens for UDP packets on laddr.
+func ListenUDP(c conn, cfg Config) (*Table, error) {
+	tab, _, err := newUDP(c, cfg)
+	if err != nil {
+		return nil, err
+	}
+	log.Info("UDP listener up", "self", tab.self)
 	return tab, nil
 }
 
-func newUDP(priv *ecdsa.PrivateKey, c conn, natm nat.Interface, nodeDBPath string) (*Table, *udp, error) {
+func newUDP(c conn, cfg Config) (*Table, *udp, error) {
 	udp := &udp{
-		conn:       c,
-		priv:       priv,
-		closing:    make(chan struct{}),
-		gotreply:   make(chan reply),
-		addpending: make(chan *pending),
+		conn:        c,
+		priv:        cfg.PrivateKey,
+		netrestrict: cfg.NetRestrict,
+		closing:     make(chan struct{}),
+		gotreply:    make(chan reply),
+		addpending:  make(chan *pending),
 	}
 	realaddr := c.LocalAddr().(*net.UDPAddr)
-	if natm != nil {
-		if !realaddr.IP.IsLoopback() {
-			go nat.Map(natm, udp.closing, "udp", realaddr.Port, realaddr.Port, "ethereum discovery")
-		}
-		// TODO: react to external IP changes over time.
-		if ext, err := natm.ExternalIP(); err == nil {
-			realaddr = &net.UDPAddr{IP: ext, Port: realaddr.Port}
-		}
+	if cfg.AnnounceAddr != nil {
+		realaddr = cfg.AnnounceAddr
 	}
 	// TODO: separate TCP port
 	udp.ourEndpoint = makeEndpoint(realaddr, uint16(realaddr.Port))
-	tab, err := newTable(udp, PubkeyID(&priv.PublicKey), realaddr, nodeDBPath)
+	tab, err := newTable(udp, PubkeyID(&cfg.PrivateKey.PublicKey), realaddr, cfg.NodeDBPath, cfg.Bootnodes)
 	if err != nil {
 		return nil, nil, err
 	}
 	udp.Table = tab
 
 	go udp.loop()
-	go udp.readLoop()
+	go udp.readLoop(cfg.Unhandled)
 	return udp.Table, udp, nil
 }
 
@@ -301,15 +270,33 @@ func (t *udp) close() {
 
 // ping sends a ping message to the given node and waits for a reply.
 func (t *udp) ping(toid NodeID, toaddr *net.UDPAddr) error {
-	// TODO: maybe check for ReplyTo field in callback to measure RTT
-	errc := t.pending(toid, pongPacket, func(interface{}) bool { return true })
-	t.send(toaddr, pingPacket, ping{
-		Version:    Version,
+	return <-t.sendPing(toid, toaddr, nil)
+}
+
+// sendPing sends a ping message to the given node and invokes the callback
+// when the reply arrives.
+func (t *udp) sendPing(toid NodeID, toaddr *net.UDPAddr, callback func()) <-chan error {
+	req := &ping{
+		Version:    4,
 		From:       t.ourEndpoint,
 		To:         makeEndpoint(toaddr, 0), // TODO: maybe use known TCP port from DB
 		Expiration: uint64(time.Now().Add(expiration).Unix()),
+	}
+	packet, hash, err := encodePacket(t.priv, pingPacket, req)
+	if err != nil {
+		errc := make(chan error, 1)
+		errc <- err
+		return errc
+	}
+	errc := t.pending(toid, pongPacket, func(p interface{}) bool {
+		ok := bytes.Equal(p.(*pong).ReplyTok, hash)
+		if ok && callback != nil {
+			callback()
+		}
+		return ok
 	})
-	return <-errc
+	t.write(toaddr, req.name(), packet)
+	return errc
 }
 
 func (t *udp) waitping(from NodeID) error {
@@ -319,46 +306,33 @@ func (t *udp) waitping(from NodeID) error {
 // findnode sends a findnode request to the given node and waits until
 // the node has sent up to k neighbors.
 func (t *udp) findnode(toid NodeID, toaddr *net.UDPAddr, target NodeID) ([]*Node, error) {
+	// If we haven't seen a ping from the destination node for a while, it won't remember
+	// our endpoint proof and reject findnode. Solicit a ping first.
+	if time.Since(t.db.lastPingReceived(toid)) > nodeDBNodeExpiration {
+		t.ping(toid, toaddr)
+		t.waitping(toid)
+	}
+
 	nodes := make([]*Node, 0, bucketSize)
 	nreceived := 0
 	errc := t.pending(toid, neighborsPacket, func(r interface{}) bool {
 		reply := r.(*neighbors)
 		for _, rn := range reply.Nodes {
 			nreceived++
-			if n, err := t.nodeFromRPC(toaddr, rn); err == nil {
-				nodes = append(nodes, n)
+			n, err := t.nodeFromRPC(toaddr, rn)
+			if err != nil {
+				log.Trace("Invalid neighbor node received", "ip", rn.IP, "addr", toaddr, "err", err)
+				continue
 			}
+			nodes = append(nodes, n)
 		}
 		return nreceived >= bucketSize
 	})
-	t.send(toaddr, findnodePacket, findnode{
+	t.send(toaddr, findnodePacket, &findnode{
 		Target:     target,
 		Expiration: uint64(time.Now().Add(expiration).Unix()),
 	})
-	err := <-errc
-
-	// remove nodes from *neighbors response
-	// where the originating address (toaddr) is *not* reserved and the given neighbor is reserved.
-	// This prevents irrelevant private network addresses from causing
-	// attempted discoveries on reserved ips that are not on
-	// our node's network.
-	// > https://en.wikipedia.org/wiki/Reserved_IP_addresses
-	// > https://github.com/ethereumproject/go-ethereum/issues/283
-	// > https://tools.ietf.org/html/rfc5737
-	// > https://tools.ietf.org/html/rfc3849
-	if !isReserved(toaddr.IP) {
-		var okNodes []*Node
-		for _, n := range nodes {
-			if isReserved(n.IP) {
-				glog.V(logger.Detail).Warnf("%v: removing from neighbors: toaddr: %v, id: %v, ip: %v", errReservedAddress, toaddr, n.ID, n.IP)
-				continue
-			}
-			okNodes = append(okNodes, n)
-		}
-		nodes = okNodes
-	}
-
-	return nodes, err
+	return nodes, <-errc
 }
 
 // pending adds a reply callback to the pending reply queue.
@@ -511,140 +485,81 @@ func init() {
 	}
 }
 
-func (t *udp) send(toaddr *net.UDPAddr, ptype byte, req interface{}) error {
-	packet, err := encodePacket(t.priv, ptype, req)
+func (t *udp) send(toaddr *net.UDPAddr, ptype byte, req packet) ([]byte, error) {
+	packet, hash, err := encodePacket(t.priv, ptype, req)
 	if err != nil {
-		return err
+		return hash, err
 	}
-	if logger.MlogEnabled() {
-		switch ptype {
-		// @sorpass: again, performance penalty?
-		case pingPacket:
-			mlogPingSendTo.AssignDetails(
-				toaddr.String(),
-				len(packet),
-			).Send(mlogDiscover)
-		case pongPacket:
-			mlogPongSendTo.AssignDetails(
-				toaddr.String(),
-				len(packet),
-			).Send(mlogDiscover)
-		case findnodePacket:
-			mlogFindNodeSendTo.AssignDetails(
-				toaddr.String(),
-				len(packet),
-			).Send(mlogDiscover)
-		case neighborsPacket:
-			mlogNeighborsSendTo.AssignDetails(
-				toaddr.String(),
-				len(packet),
-			).Send(mlogDiscover)
-		}
-	}
-	if glog.V(logger.Detail) {
-		glog.Infof(">>> %v %T\n", toaddr, req)
-	}
+	return hash, t.write(toaddr, req.name(), packet)
+}
 
-	if _, err = t.conn.WriteToUDP(packet, toaddr); err != nil {
-		glog.V(logger.Detail).Infoln("UDP send failed:", err)
-	}
+func (t *udp) write(toaddr *net.UDPAddr, what string, packet []byte) error {
+	_, err := t.conn.WriteToUDP(packet, toaddr)
+	log.Trace(">> "+what, "addr", toaddr, "err", err)
 	return err
 }
 
-func encodePacket(priv *ecdsa.PrivateKey, ptype byte, req interface{}) ([]byte, error) {
+func encodePacket(priv *ecdsa.PrivateKey, ptype byte, req interface{}) (packet, hash []byte, err error) {
 	b := new(bytes.Buffer)
 	b.Write(headSpace)
 	b.WriteByte(ptype)
 	if err := rlp.Encode(b, req); err != nil {
-		glog.V(logger.Error).Infoln("error encoding packet:", err)
-		return nil, err
+		log.Error("Can't encode discv4 packet", "err", err)
+		return nil, nil, err
 	}
-	packet := b.Bytes()
+	packet = b.Bytes()
 	sig, err := crypto.Sign(crypto.Keccak256(packet[headSize:]), priv)
 	if err != nil {
-		glog.V(logger.Error).Infoln("could not sign packet:", err)
-		return nil, err
+		log.Error("Can't sign discv4 packet", "err", err)
+		return nil, nil, err
 	}
 	copy(packet[macSize:], sig)
 	// add the hash to the front. Note: this doesn't protect the
 	// packet in any way. Our public key will be part of this hash in
 	// The future.
-	copy(packet, crypto.Keccak256(packet[macSize:]))
-	return packet, nil
-}
-
-func isTemporaryError(err error) bool {
-	tempErr, ok := err.(interface {
-		Temporary() bool
-	})
-	return ok && tempErr.Temporary() || isPacketTooBig(err)
+	hash = crypto.Keccak256(packet[macSize:])
+	copy(packet, hash)
+	return packet, hash, nil
 }
 
 // readLoop runs in its own goroutine. it handles incoming UDP packets.
-func (t *udp) readLoop() {
+func (t *udp) readLoop(unhandled chan<- ReadPacket) {
 	defer t.conn.Close()
+	if unhandled != nil {
+		defer close(unhandled)
+	}
 	// Discovery packets are defined to be no larger than 1280 bytes.
 	// Packets larger than this size will be cut at the end and treated
 	// as invalid because their hash won't match.
 	buf := make([]byte, 1280)
 	for {
 		nbytes, from, err := t.conn.ReadFromUDP(buf)
-		if isTemporaryError(err) {
+		if netutil.IsTemporaryError(err) {
 			// Ignore temporary read errors.
-			glog.V(logger.Debug).Infof("Temporary read error: %v", err)
+			log.Debug("Temporary UDP read error", "err", err)
 			continue
 		} else if err != nil {
 			// Shut down the loop for permament errors.
-			glog.V(logger.Debug).Infof("Read error: %v", err)
+			log.Debug("UDP read error", "err", err)
 			return
 		}
-		t.handlePacket(from, buf[:nbytes])
+		if t.handlePacket(from, buf[:nbytes]) != nil && unhandled != nil {
+			select {
+			case unhandled <- ReadPacket{buf[:nbytes], from}:
+			default:
+			}
+		}
 	}
 }
 
 func (t *udp) handlePacket(from *net.UDPAddr, buf []byte) error {
 	packet, fromID, hash, err := decodePacket(buf)
 	if err != nil {
-		glog.V(logger.Debug).Infof("Bad packet from %v: %v\n", from, err)
+		log.Debug("Bad discv4 packet", "addr", from, "err", err)
 		return err
 	}
-	status := "ok"
-	if err = packet.handle(t, from, fromID, hash); err != nil {
-		status = err.Error()
-	}
-	if logger.MlogEnabled() {
-		// Use fmt Type interpolator to decide kind of request received,
-		// since packet is an interface with 1 method: handle.
-		switch p := fmt.Sprintf("%T", packet); p {
-		case "*discover.ping":
-			mlogPingHandleFrom.AssignDetails(
-				from.String(),
-				fromID.String(),
-				len(buf),
-			).Send(mlogDiscover)
-		case "*discover.pong":
-			mlogPongHandleFrom.AssignDetails(
-				from.String(),
-				fromID.String(),
-				len(buf),
-			).Send(mlogDiscover)
-		case "*discover.findnode":
-			mlogFindNodeHandleFrom.AssignDetails(
-				from.String(),
-				fromID.String(),
-				len(buf),
-			).Send(mlogDiscover)
-		case "*discover.neighbors":
-			mlogNeighborsHandleFrom.AssignDetails(
-				from.String(),
-				fromID.String(),
-				len(buf),
-			).Send(mlogDiscover)
-		}
-	}
-	if glog.V(logger.Detail) {
-		glog.Infof("<<< %v %T: %s\n", from, packet, status)
-	}
+	err = packet.handle(t, from, fromID, hash)
+	log.Trace("<< "+packet.name(), "addr", from, "err", err)
 	return err
 }
 
@@ -683,17 +598,26 @@ func (req *ping) handle(t *udp, from *net.UDPAddr, fromID NodeID, mac []byte) er
 	if expired(req.Expiration) {
 		return errExpired
 	}
-	t.send(from, pongPacket, pong{
+	t.send(from, pongPacket, &pong{
 		To:         makeEndpoint(from, req.From.TCP),
 		ReplyTok:   mac,
 		Expiration: uint64(time.Now().Add(expiration).Unix()),
 	})
-	if !t.handleReply(fromID, pingPacket, req) {
-		// Note: we're ignoring the provided IP address right now
-		go t.bond(true, fromID, from, req.From.TCP)
+	t.handleReply(fromID, pingPacket, req)
+
+	// Add the node to the table. Before doing so, ensure that we have a recent enough pong
+	// recorded in the database so their findnode requests will be accepted later.
+	n := NewNode(fromID, from.IP, uint16(from.Port), req.From.TCP)
+	if time.Since(t.db.lastPongReceived(fromID)) > nodeDBNodeExpiration {
+		t.sendPing(fromID, from, func() { t.addThroughPing(n) })
+	} else {
+		t.addThroughPing(n)
 	}
+	t.db.updateLastPingReceived(fromID, time.Now())
 	return nil
 }
+
+func (req *ping) name() string { return "PING/v4" }
 
 func (req *pong) handle(t *udp, from *net.UDPAddr, fromID NodeID, mac []byte) error {
 	if expired(req.Expiration) {
@@ -702,38 +626,51 @@ func (req *pong) handle(t *udp, from *net.UDPAddr, fromID NodeID, mac []byte) er
 	if !t.handleReply(fromID, pongPacket, req) {
 		return errUnsolicitedReply
 	}
+	t.db.updateLastPongReceived(fromID, time.Now())
 	return nil
 }
+
+func (req *pong) name() string { return "PONG/v4" }
 
 func (req *findnode) handle(t *udp, from *net.UDPAddr, fromID NodeID, mac []byte) error {
 	if expired(req.Expiration) {
 		return errExpired
 	}
-	if t.db.node(fromID) == nil {
-		// No bond exists, we don't process the packet. This prevents
-		// an attack vector where the discovery protocol could be used
-		// to amplify traffic in a DDOS attack. A malicious actor
-		// would send a findnode request with the IP address and UDP
-		// port of the target as the source address. The recipient of
-		// the findnode packet would then send a neighbors packet
-		// (which is a much bigger packet than findnode) to the victim.
+	if !t.db.hasBond(fromID) {
+		// No endpoint proof pong exists, we don't process the packet. This prevents an
+		// attack vector where the discovery protocol could be used to amplify traffic in a
+		// DDOS attack. A malicious actor would send a findnode request with the IP address
+		// and UDP port of the target as the source address. The recipient of the findnode
+		// packet would then send a neighbors packet (which is a much bigger packet than
+		// findnode) to the victim.
 		return errUnknownNode
 	}
-	closest := t.closest(req.Target).Slice()
+	target := crypto.Keccak256Hash(req.Target[:])
+	t.mutex.Lock()
+	closest := t.closest(target, bucketSize).entries
+	t.mutex.Unlock()
 
 	p := neighbors{Expiration: uint64(time.Now().Add(expiration).Unix())}
-
+	var sent bool
 	// Send neighbors in chunks with at most maxNeighbors per packet
 	// to stay below the 1280 byte limit.
-	for i, n := range closest {
-		p.Nodes = append(p.Nodes, nodeToRPC(n))
-		if len(p.Nodes) == maxNeighbors || i == len(closest)-1 {
-			t.send(from, neighborsPacket, p)
-			p.Nodes = p.Nodes[:0]
+	for _, n := range closest {
+		if netutil.CheckRelayIP(from.IP, n.IP) == nil {
+			p.Nodes = append(p.Nodes, nodeToRPC(n))
 		}
+		if len(p.Nodes) == maxNeighbors {
+			t.send(from, neighborsPacket, &p)
+			p.Nodes = p.Nodes[:0]
+			sent = true
+		}
+	}
+	if len(p.Nodes) > 0 || !sent {
+		t.send(from, neighborsPacket, &p)
 	}
 	return nil
 }
+
+func (req *findnode) name() string { return "FINDNODE/v4" }
 
 func (req *neighbors) handle(t *udp, from *net.UDPAddr, fromID NodeID, mac []byte) error {
 	if expired(req.Expiration) {
@@ -745,65 +682,8 @@ func (req *neighbors) handle(t *udp, from *net.UDPAddr, fromID NodeID, mac []byt
 	return nil
 }
 
+func (req *neighbors) name() string { return "NEIGHBORS/v4" }
+
 func expired(ts uint64) bool {
 	return time.Unix(int64(ts), 0).Before(time.Now())
-}
-
-func isReserved(ip net.IP) bool {
-	reserved := [][2]net.IP{
-		Ipv4ReservedRangeThis,
-		Ipv4ReservedRangePrivateNetwork,
-		ipv4ReservedRangeProviderSubscriber,
-		Ipv4ReservedRangeLoopback,
-		ipv4ReservedRangeLinkLocal,
-		ipv4ReservedRangeLocalPrivate1,
-		ipv4ReservedRangeSpecialPurpose,
-		ipv4ReservedRangeTestNet1,
-		ipv4ReservedRange6to4,
-		Ipv4ReservedRangeLocalPrivate2,
-		ipv4ReservedRangeSubnets,
-		ipv4ReservedRangeTestNet2,
-		ipv4ReservedRangeTestNet3,
-		ipv4ReservedRangeMulticast,
-		ipv4ReservedRangeFuture,
-		ipv4ReservedRangeLimitedBroadcast,
-		ipv6ReservedRangeUnspecified,
-		Ipv6ReservedRangeLoopback,
-		ipv6ReservedRangeDocumentation,
-		ipv6ReservedRange6to4,
-		ipv6ReservedRangeUniqueLocal,
-		ipv6ReservedRangeLinkLocal,
-		ipv6ReservedRangeMulticast,
-	}
-	for _, r := range reserved {
-		isReserved, err := IpBetween(r[0], r[1], ip)
-		if err != nil {
-			glog.V(logger.Debug).Infof("error checking if ip reserved: %v", err)
-			return true
-		}
-		if isReserved {
-			return true
-		}
-	}
-	return false
-}
-
-// IpBetween determines if a given ip is between two others (inclusive)
-// > https://stackoverflow.com/questions/19882961/go-golang-check-ip-address-in-range
-func IpBetween(from net.IP, to net.IP, test net.IP) (bool, error) {
-	if from == nil || to == nil || test == nil {
-		return false, errInvalidIp
-	}
-
-	from16 := from.To16()
-	to16 := to.To16()
-	test16 := test.To16()
-	if from16 == nil || to16 == nil || test16 == nil {
-		return false, errors.New("ip did not convert to a 16 byte")
-	}
-
-	if bytes.Compare(test16, from16) >= 0 && bytes.Compare(test16, to16) <= 0 {
-		return true, nil
-	}
-	return false, nil
 }

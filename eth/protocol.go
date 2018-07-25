@@ -21,9 +21,11 @@ import (
 	"io"
 	"math/big"
 
-	"github.com/ethereumproject/go-ethereum/common"
-	"github.com/ethereumproject/go-ethereum/core/types"
-	"github.com/ethereumproject/go-ethereum/rlp"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/rlp"
 )
 
 // Constants to match up protocol versions and messages
@@ -32,19 +34,16 @@ const (
 	eth63 = 63
 )
 
-// Official short name of the protocol used during capability negotiation.
+// ProtocolName is the official short name of the protocol used during capability negotiation.
 var ProtocolName = "eth"
 
-// Supported versions of the eth protocol (first is primary).
+// ProtocolVersions are the upported versions of the eth protocol (first is primary).
 var ProtocolVersions = []uint{eth63, eth62}
 
-// Number of implemented message corresponding to different protocol versions.
+// ProtocolLengths are the number of implemented message corresponding to different protocol versions.
 var ProtocolLengths = []uint64{17, 8}
 
-const (
-	NetworkId          = 1
-	ProtocolMaxMsgSize = 10 * 1024 * 1024 // Maximum cap on the size of a protocol message
-)
+const ProtocolMaxMsgSize = 10 * 1024 * 1024 // Maximum cap on the size of a protocol message
 
 // eth protocol message codes
 const (
@@ -64,37 +63,6 @@ const (
 	GetReceiptsMsg = 0x0f
 	ReceiptsMsg    = 0x10
 )
-
-func ProtocolMessageStringer(m uint) string {
-	switch m {
-	case StatusMsg:
-		return "Status"
-	case NewBlockHashesMsg:
-		return "NewBlockHashes"
-	case TxMsg:
-		return "Txs"
-	case GetBlockHeadersMsg:
-		return "GetBlockHeaders"
-	case BlockHeadersMsg:
-		return "BlockHeaders"
-	case GetBlockBodiesMsg:
-		return "GetBlockBodies"
-	case BlockBodiesMsg:
-		return "BlockBodies"
-	case NewBlockMsg:
-		return "NewBlock"
-	case GetNodeDataMsg:
-		return "GetNodeData"
-	case NodeDataMsg:
-		return "NodeData"
-	case GetReceiptsMsg:
-		return "GetReceipts"
-	case ReceiptsMsg:
-		return "Receipts"
-	default:
-		return "Unknown"
-	}
-}
 
 type errCode int
 
@@ -128,46 +96,32 @@ var errorToString = map[int]string{
 }
 
 type txPool interface {
-	// AddTransactions should add the given transactions to the pool.
-	AddTransactions([]*types.Transaction)
+	// AddRemotes should add the given transactions to the pool.
+	AddRemotes([]*types.Transaction) []error
 
-	// GetTransactions should return pending transactions.
+	// Pending should return pending transactions.
 	// The slice should be modifiable by the caller.
-	GetTransactions() types.Transactions
+	Pending() (map[common.Address]types.Transactions, error)
+
+	// SubscribeNewTxsEvent should return an event subscription of
+	// NewTxsEvent and send events to the given channel.
+	SubscribeNewTxsEvent(chan<- core.NewTxsEvent) event.Subscription
 }
 
 // statusData is the network packet for the status message.
 type statusData struct {
 	ProtocolVersion uint32
-	NetworkId       uint32
+	NetworkId       uint64
 	TD              *big.Int
 	CurrentBlock    common.Hash
 	GenesisBlock    common.Hash
 }
 
-// newBlockData is the network packet for the block propagation message.
-type newBlockData struct {
-	Block *types.Block
-	TD    *big.Int
-}
-
-// blockBody represents the data content of a single block.
-type blockBody struct {
-	Transactions []*types.Transaction // Transactions contained within a block
-	Uncles       []*types.Header      // Uncles contained within a block
-}
-
-// blockBodiesData is the network packet for block content distribution.
-type blockBodiesData []*blockBody
-
-// announce is received with NewBlockHashesMsg
-type announce struct {
+// newBlockHashesData is the network packet for the block announcements.
+type newBlockHashesData []struct {
 	Hash   common.Hash // Hash of one particular block being announced
 	Number uint64      // Number of one particular block being announced
 }
-
-// newBlockHashesData is the network packet for the block announcements.
-type newBlockHashesData []announce
 
 // getBlockHeadersData represents a block header query.
 type getBlockHeadersData struct {
@@ -212,3 +166,18 @@ func (hn *hashOrNumber) DecodeRLP(s *rlp.Stream) error {
 	}
 	return err
 }
+
+// newBlockData is the network packet for the block propagation message.
+type newBlockData struct {
+	Block *types.Block
+	TD    *big.Int
+}
+
+// blockBody represents the data content of a single block.
+type blockBody struct {
+	Transactions []*types.Transaction // Transactions contained within a block
+	Uncles       []*types.Header      // Uncles contained within a block
+}
+
+// blockBodiesData is the network packet for block content distribution.
+type blockBodiesData []*blockBody

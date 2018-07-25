@@ -1,4 +1,4 @@
-// Copyright 2015 The go-ethereum Authors
+// Copyright 2016 The go-ethereum Authors
 // This file is part of the go-ethereum library.
 //
 // The go-ethereum library is free software: you can redistribute it and/or modify
@@ -23,12 +23,21 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/fatih/color"
 	"github.com/robertkrimen/otto"
 )
 
 const (
 	maxPrettyPrintLevel = 3
 	indentString        = "  "
+)
+
+var (
+	FunctionColor = color.New(color.FgMagenta).SprintfFunc()
+	SpecialColor  = color.New(color.Bold).SprintfFunc()
+	NumberColor   = color.New(color.FgRed).SprintfFunc()
+	StringColor   = color.New(color.FgGreen).SprintfFunc()
+	ErrorColor    = color.New(color.FgHiRed).SprintfFunc()
 )
 
 // these fields are hidden when printing objects.
@@ -53,13 +62,13 @@ func prettyError(vm *otto.Otto, err error, w io.Writer) {
 	if ottoErr, ok := err.(*otto.Error); ok {
 		failure = ottoErr.String()
 	}
-	fmt.Fprint(w, "\x1b[91m", failure, "\x1b[0m")
+	fmt.Fprint(w, ErrorColor("%s", failure))
 }
 
-func prettyPrintJS(call otto.FunctionCall, w io.Writer) otto.Value {
+func (re *JSRE) prettyPrintJS(call otto.FunctionCall) otto.Value {
 	for _, v := range call.ArgumentList {
-		prettyPrint(call.Otto, v, w)
-		fmt.Fprintln(w)
+		prettyPrint(call.Otto, v, re.output)
+		fmt.Fprintln(re.output)
 	}
 	return otto.UndefinedValue()
 }
@@ -67,22 +76,6 @@ func prettyPrintJS(call otto.FunctionCall, w io.Writer) otto.Value {
 type ppctx struct {
 	vm *otto.Otto
 	w  io.Writer
-}
-
-func (ctx ppctx) printFunction(a interface{}) {
-	fmt.Fprint(ctx.w, "\x1b[35m", a, "\x1b[0m")
-}
-
-func (ctx ppctx) printSpecial(a interface{}) {
-	fmt.Fprint(ctx.w, "\x1b[1m", a, "\x1b[0m")
-}
-
-func (ctx ppctx) printNumber(a interface{}) {
-	fmt.Fprint(ctx.w, "\x1b[31m", a, "\x1b[0m")
-}
-
-func (ctx ppctx) printString(a interface{}) {
-	fmt.Fprint(ctx.w, "\x1b[32m", a, "\x1b[0m")
 }
 
 func (ctx ppctx) indent(level int) string {
@@ -94,20 +87,20 @@ func (ctx ppctx) printValue(v otto.Value, level int, inArray bool) {
 	case v.IsObject():
 		ctx.printObject(v.Object(), level, inArray)
 	case v.IsNull():
-		ctx.printSpecial("null")
+		fmt.Fprint(ctx.w, SpecialColor("null"))
 	case v.IsUndefined():
-		ctx.printSpecial("undefined")
+		fmt.Fprint(ctx.w, SpecialColor("undefined"))
 	case v.IsString():
 		s, _ := v.ToString()
-		ctx.printString(strconv.Quote(s))
+		fmt.Fprint(ctx.w, StringColor("%q", s))
 	case v.IsBoolean():
 		b, _ := v.ToBoolean()
-		ctx.printSpecial(b)
+		fmt.Fprint(ctx.w, SpecialColor("%t", b))
 	case v.IsNaN():
-		ctx.printNumber("NaN")
+		fmt.Fprint(ctx.w, NumberColor("NaN"))
 	case v.IsNumber():
 		s, _ := v.ToString()
-		ctx.printNumber(s)
+		fmt.Fprint(ctx.w, NumberColor("%s", s))
 	default:
 		fmt.Fprint(ctx.w, "<unprintable>")
 	}
@@ -115,7 +108,7 @@ func (ctx ppctx) printValue(v otto.Value, level int, inArray bool) {
 
 func (ctx ppctx) printObject(obj *otto.Object, level int, inArray bool) {
 	switch obj.Class() {
-	case "Array":
+	case "Array", "GoArray":
 		lv, _ := obj.Get("length")
 		len, _ := lv.ToInteger()
 		if len == 0 {
@@ -141,7 +134,7 @@ func (ctx ppctx) printObject(obj *otto.Object, level int, inArray bool) {
 	case "Object":
 		// Print values from bignumber.js as regular numbers.
 		if ctx.isBigNumber(obj) {
-			ctx.printNumber(toString(obj))
+			fmt.Fprint(ctx.w, NumberColor("%s", toString(obj)))
 			return
 		}
 		// Otherwise, print all fields indented, but stop if we're too deep.
@@ -172,15 +165,15 @@ func (ctx ppctx) printObject(obj *otto.Object, level int, inArray bool) {
 	case "Function":
 		// Use toString() to display the argument list if possible.
 		if robj, err := obj.Call("toString"); err != nil {
-			ctx.printFunction("function()")
+			fmt.Fprint(ctx.w, FunctionColor("function()"))
 		} else {
 			desc := strings.Trim(strings.Split(robj.String(), "{")[0], " \t\n")
 			desc = strings.Replace(desc, " (", "(", 1)
-			ctx.printFunction(desc)
+			fmt.Fprint(ctx.w, FunctionColor("%s", desc))
 		}
 
 	case "RegExp":
-		ctx.printString(toString(obj))
+		fmt.Fprint(ctx.w, StringColor("%s", toString(obj)))
 
 	default:
 		if v, _ := obj.Get("toString"); v.IsFunction() && level <= maxPrettyPrintLevel {

@@ -15,7 +15,7 @@ panicparse helps make sense of Go crash dumps:
 Features
 --------
 
-   * &gt;50% more compact output than original stack dump yet more readable.
+   * >50% more compact output than original stack dump yet more readable.
    * Exported symbols are bold, private symbols are darker.
    * Stdlib is green, main is yellow, rest is red.
    * Deduplicates redundant goroutine stacks. Useful for large server crashes.
@@ -118,22 +118,6 @@ done that.
 
 ### If you have `/usr/bin/pp` installed
 
-If you try `pp` for the first time and you get:
-
-    Creating tables and indexes...
-    Done.
-
-and/or
-
-    /usr/bin/pp5.18: No input files specified
-
-you may be running the _Perl PAR Packager_ instead of panicparse.
-
-You have two choices, either you put `$GOPATH/bin` at the begining of `$PATH` or
-use long name `panicparse` with:
+You may have the Perl PAR Packager installed. Use long name `panicparse` then;
 
     go get github.com/maruel/panicparse
-
-then using `panicparse` instead of `pp`:
-
-    go test 2> panicparse

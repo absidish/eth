@@ -49,7 +49,7 @@ arguments. It will pass the mod argument as nil to the RPC method.
 The server offers the ServeCodec method which accepts a ServerCodec instance. It will
 read requests from the codec, process the request and sends the response back to the
 client using the codec. The server can execute requests concurrently. Responses
-can be send back to the client out of order.
+can be sent back to the client out of order.
 
 An example server which uses the JSON codec:
  type CalculatorService struct {}
@@ -58,7 +58,7 @@ An example server which uses the JSON codec:
 	return a + b
  }
 
- func (s *CalculatorService Div(a, b int) (int, error) {
+ func (s *CalculatorService) Div(a, b int) (int, error) {
 	if b == 0 {
 		return 0, errors.New("divide by zero")
 	}
@@ -92,7 +92,7 @@ An example method:
 Subscriptions are deleted when:
  - the user sends an unsubscribe request
  - the connection which was used to create the subscription is closed. This can be initiated
-   by the client and server. The server will close the connection on an write error or when
+   by the client and server. The server will close the connection on a write error or when
    the queue of buffered notifications gets too big.
 */
 package rpc

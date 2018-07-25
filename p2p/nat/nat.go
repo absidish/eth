@@ -21,13 +21,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/ethereumproject/go-ethereum/logger"
-	"github.com/ethereumproject/go-ethereum/logger/glog"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/jackpal/go-nat-pmp"
 )
 
@@ -50,14 +48,6 @@ type Interface interface {
 	// Should return name of the method. This is used for logging.
 	String() string
 }
-
-type autodiscoverInterfaceType string
-
-const (
-	autoDiscUPnPOrNatPMP = "UPnP or NAT-PMP"
-	autoDiscUPnP         = "UPnP"
-	autoDiscNatPMP       = "NAT-PMP"
-)
 
 // Parse parses a NAT interface description.
 // The following formats are currently accepted.
@@ -108,38 +98,18 @@ const (
 // Map adds a port mapping on m and keeps it alive until c is closed.
 // This function is typically invoked in its own goroutine.
 func Map(m Interface, c chan struct{}, protocol string, extport, intport int, name string) {
+	log := log.New("proto", protocol, "extport", extport, "intport", intport, "interface", m)
 	refresh := time.NewTimer(mapUpdateInterval)
-
 	defer func() {
 		refresh.Stop()
-		glog.V(logger.Debug).Infof("Deleting port mapping: %s %d -> %d (%s) using %s\n", protocol, extport, intport, name, m)
+		log.Debug("Deleting port mapping")
 		m.DeleteMapping(protocol, extport, intport)
 	}()
-
-	refreshPortMappingLabel := "Refresh port mapping"
-
-	handleIfAddMappingErr := func(label string, err error) {
-		if err == nil {
-			glog.V(logger.Debug).Infof("%s %s:%d -> %d (%s) using %s\n", label, protocol, extport, intport, name, m)
-			// eg on start up
-			if label != refreshPortMappingLabel {
-				glog.D(logger.Info).Infof("%s %s:%s -> %s (%s) using %s\n", label, logger.ColorGreen(protocol), logger.ColorGreen(strconv.Itoa(extport)), logger.ColorGreen(strconv.Itoa(intport)), name, m)
-			}
-		} else {
-			switch m.String() {
-			// if upnp error, not critical
-			case autoDiscUPnPOrNatPMP:
-				glog.V(logger.Debug).Infof("%s: Network port %s:%d could not be mapped: %v\n", label, protocol, intport, err)
-				return
-			default:
-				glog.V(logger.Error).Errorf("%s: Network port %s:%d could not be mapped: %v\n", label, protocol, intport, err)
-			}
-		}
+	if err := m.AddMapping(protocol, extport, intport, name, mapTimeout); err != nil {
+		log.Debug("Couldn't add port mapping", "err", err)
+	} else {
+		log.Info("Mapped network port")
 	}
-
-	err := m.AddMapping(protocol, intport, extport, name, mapTimeout)
-	handleIfAddMappingErr("Mapping network port", err)
-
 	for {
 		select {
 		case _, ok := <-c:
@@ -147,9 +117,10 @@ func Map(m Interface, c chan struct{}, protocol string, extport, intport int, na
 				return
 			}
 		case <-refresh.C:
-			glog.V(logger.Debug).Infof("Refresh port mapping %s:%d -> %d (%s) using %s\n", protocol, extport, intport, name, m)
-			err := m.AddMapping(protocol, intport, extport, name, mapTimeout)
-			handleIfAddMappingErr(refreshPortMappingLabel, err)
+			log.Trace("Refreshing port mapping")
+			if err := m.AddMapping(protocol, extport, intport, name, mapTimeout); err != nil {
+				log.Debug("Couldn't add port mapping", "err", err)
+			}
 			refresh.Reset(mapUpdateInterval)
 		}
 	}
@@ -179,7 +150,7 @@ func (extIP) DeleteMapping(string, int, int) error                     { return 
 func Any() Interface {
 	// TODO: attempt to discover whether the local machine has an
 	// Internet-class address. Return ExtIP in this case.
-	return startautodisc(autoDiscUPnPOrNatPMP, func() Interface {
+	return startautodisc("UPnP or NAT-PMP", func() Interface {
 		found := make(chan Interface, 2)
 		go func() { found <- discoverUPnP() }()
 		go func() { found <- discoverPMP() }()
@@ -195,7 +166,7 @@ func Any() Interface {
 // UPnP returns a port mapper that uses UPnP. It will attempt to
 // discover the address of your router using UDP broadcasts.
 func UPnP() Interface {
-	return startautodisc(autoDiscUPnP, discoverUPnP)
+	return startautodisc("UPnP", discoverUPnP)
 }
 
 // PMP returns a port mapper that uses NAT-PMP. The provided gateway
@@ -205,7 +176,7 @@ func PMP(gateway net.IP) Interface {
 	if gateway != nil {
 		return &pmp{gw: gateway, c: natpmp.NewClient(gateway)}
 	}
-	return startautodisc(autoDiscNatPMP, discoverPMP)
+	return startautodisc("NAT-PMP", discoverPMP)
 }
 
 // autodisc represents a port mapping mechanism that is still being
@@ -224,14 +195,9 @@ type autodisc struct {
 	found Interface
 }
 
-func startautodisc(what autodiscoverInterfaceType, doit func() Interface) Interface {
+func startautodisc(what string, doit func() Interface) Interface {
 	// TODO: monitor network configuration and rerun doit when it changes.
-	// TODO: dont cast the string, use actual types
-	ad := &autodisc{what: string(what), doit: doit}
-	// Start the auto discovery as early as possible so it is already
-	// in progress when the rest of the stack calls the methods.
-	go ad.wait()
-	return ad
+	return &autodisc{what: what, doit: doit}
 }
 
 func (n *autodisc) AddMapping(protocol string, extport, intport int, name string, lifetime time.Duration) error {

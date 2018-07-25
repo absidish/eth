@@ -19,9 +19,9 @@ package core
 import (
 	"container/list"
 
-	"github.com/ethereumproject/go-ethereum/core/types"
-	"github.com/ethereumproject/go-ethereum/ethdb"
-	"github.com/ethereumproject/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/event"
 )
 
 // Implement our EthTest Manager
@@ -35,24 +35,24 @@ type TestManager struct {
 	Blocks     []*types.Block
 }
 
-func (s *TestManager) IsListening() bool {
+func (tm *TestManager) IsListening() bool {
 	return false
 }
 
-func (s *TestManager) IsMining() bool {
+func (tm *TestManager) IsMining() bool {
 	return false
 }
 
-func (s *TestManager) PeerCount() int {
+func (tm *TestManager) PeerCount() int {
 	return 0
 }
 
-func (s *TestManager) Peers() *list.List {
+func (tm *TestManager) Peers() *list.List {
 	return list.New()
 }
 
-func (s *TestManager) BlockChain() *BlockChain {
-	return s.blockChain
+func (tm *TestManager) BlockChain() *BlockChain {
+	return tm.blockChain
 }
 
 func (tm *TestManager) TxPool() *TxPool {
@@ -73,4 +73,14 @@ func (tm *TestManager) EventMux() *event.TypeMux {
 
 func (tm *TestManager) Db() ethdb.Database {
 	return tm.db
+}
+
+func NewTestManager() *TestManager {
+	testManager := &TestManager{}
+	testManager.eventMux = new(event.TypeMux)
+	testManager.db = ethdb.NewMemDatabase()
+	// testManager.txPool = NewTxPool(testManager)
+	// testManager.blockChain = NewBlockChain(testManager)
+	// testManager.stateManager = NewStateManager(testManager)
+	return testManager
 }

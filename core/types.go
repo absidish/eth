@@ -17,45 +17,22 @@
 package core
 
 import (
-	hexlib "encoding/hex"
-	"errors"
-	"fmt"
-	"math/big"
-
-	"github.com/ethereumproject/go-ethereum/accounts"
-	"github.com/ethereumproject/go-ethereum/core/state"
-	"github.com/ethereumproject/go-ethereum/core/types"
-	"github.com/ethereumproject/go-ethereum/core/vm"
-	"github.com/ethereumproject/go-ethereum/ethdb"
-	"github.com/ethereumproject/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/core/state"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/vm"
 )
 
-// Validator is an interface which defines the standard for block validation.
+// Validator is an interface which defines the standard for block validation. It
+// is only responsible for validating block contents, as the header validation is
+// done by the specific consensus engines.
 //
-// The validator is responsible for validating incoming block or, if desired,
-// validates headers for fast validation.
-//
-// ValidateBlock validates the given block and should return an error if it
-// failed to do so and should be used for "full" validation.
-//
-// ValidateHeader validates the given header and parent and returns an error
-// if it failed to do so.
-//
-// ValidateState validates the given statedb and optionally the receipts and
-// gas used. The implementer should decide what to do with the given input.
 type Validator interface {
-	HeaderValidator
-	ValidateBlock(block *types.Block) error
-	ValidateState(block, parent *types.Block, state *state.StateDB, receipts types.Receipts, usedGas *big.Int) error
-	VerifyUncles(block, parent *types.Block) error
-}
+	// ValidateBody validates the given block's content.
+	ValidateBody(block *types.Block) error
 
-// HeaderValidator is an interface for validating headers only
-//
-// ValidateHeader validates the given header and parent and returns an error
-// if it failed to do so.
-type HeaderValidator interface {
-	ValidateHeader(header, parent *types.Header, checkPow bool) error
+	// ValidateState validates the given statedb and optionally the receipts and
+	// gas used.
+	ValidateState(block, parent *types.Block, state *state.StateDB, receipts types.Receipts, usedGas uint64) error
 }
 
 // Processor is an interface for processing blocks using a given initial state.
@@ -65,82 +42,5 @@ type HeaderValidator interface {
 // of gas used in the process and return an error if any of the internal rules
 // failed.
 type Processor interface {
-	Process(block *types.Block, statedb *state.StateDB) (types.Receipts, vm.Logs, *big.Int, error)
-}
-
-// Backend is an interface defining the basic functionality for an operable node
-// with all the functionality to be a functional, valid Ethereum operator.
-//
-// TODO Remove this
-type Backend interface {
-	AccountManager() *accounts.Manager
-	BlockChain() *BlockChain
-	TxPool() *TxPool
-	ChainDb() ethdb.Database
-	DappDb() ethdb.Database
-	EventMux() *event.TypeMux
-}
-
-// hex is a hexadecimal string.
-type hex string
-
-// Decode fills buf when h is not empty.
-func (h hex) Decode(buf []byte) error {
-	if len(h) != 2*len(buf) {
-		return fmt.Errorf("want %d hexadecimals", 2*len(buf))
-	}
-
-	_, err := hexlib.Decode(buf, []byte(h))
-	return err
-}
-
-// prefixedHex is a hexadecimal string with an "0x" prefix.
-type prefixedHex string
-
-var errNoHexPrefix = errors.New("want 0x prefix")
-
-// Decode fills buf when h is not empty.
-func (h prefixedHex) Decode(buf []byte) error {
-	i := len(h)
-	if i == 0 {
-		return nil
-	}
-	if i == 1 || h[0] != '0' || h[1] != 'x' {
-		return errNoHexPrefix
-	}
-	if i == 2 {
-		return nil
-	}
-	if i != 2*len(buf)+2 {
-		return fmt.Errorf("want %d hexadecimals with 0x prefix", 2*len(buf))
-	}
-
-	_, err := hexlib.Decode(buf, []byte(h[2:]))
-	return err
-}
-
-func (h prefixedHex) Bytes() ([]byte, error) {
-	l := len(h)
-	if l == 0 {
-		return nil, nil
-	}
-	if l == 1 || h[0] != '0' || h[1] != 'x' {
-		return nil, errNoHexPrefix
-	}
-	if l == 2 {
-		return nil, nil
-	}
-
-	bytes := make([]byte, l/2-1)
-	_, err := hexlib.Decode(bytes, []byte(h[2:]))
-	return bytes, err
-}
-
-func (h prefixedHex) Int() (*big.Int, error) {
-	bytes, err := h.Bytes()
-	if err != nil {
-		return nil, err
-	}
-
-	return new(big.Int).SetBytes(bytes), nil
+	Process(block *types.Block, statedb *state.StateDB, cfg vm.Config) (types.Receipts, []*types.Log, uint64, error)
 }

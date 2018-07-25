@@ -93,7 +93,7 @@ func ImportECDSA(prv *ecdsa.PrivateKey) *PrivateKey {
 }
 
 // Generate an elliptic curve public / private keypair. If params is nil,
-// the recommended default paramters for the key will be chosen.
+// the recommended default parameters for the key will be chosen.
 func GenerateKey(rand io.Reader, curve elliptic.Curve, params *ECIESParams) (prv *PrivateKey, err error) {
 	pb, x, y, err := elliptic.GenerateKey(curve, rand)
 	if err != nil {
@@ -151,14 +151,16 @@ var (
 func incCounter(ctr []byte) {
 	if ctr[3]++; ctr[3] != 0 {
 		return
-	} else if ctr[2]++; ctr[2] != 0 {
-		return
-	} else if ctr[1]++; ctr[1] != 0 {
-		return
-	} else if ctr[0]++; ctr[0] != 0 {
+	}
+	if ctr[2]++; ctr[2] != 0 {
 		return
 	}
-	return
+	if ctr[1]++; ctr[1] != 0 {
+		return
+	}
+	if ctr[0]++; ctr[0] != 0 {
+		return
+	}
 }
 
 // NIST SP 800-56 Concatenation Key Derivation Function (see section 5.8.1).
@@ -228,7 +230,7 @@ func symEncrypt(rand io.Reader, params *ECIESParams, key, m []byte) (ct []byte, 
 
 // symDecrypt carries out CTR decryption using the block cipher specified in
 // the parameters
-func symDecrypt(rand io.Reader, params *ECIESParams, key, ct []byte) (m []byte, err error) {
+func symDecrypt(params *ECIESParams, key, ct []byte) (m []byte, err error) {
 	c, err := params.Cipher(key)
 	if err != nil {
 		return
@@ -290,10 +292,9 @@ func Encrypt(rand io.Reader, pub *PublicKey, m, s1, s2 []byte) (ct []byte, err e
 }
 
 // Decrypt decrypts an ECIES ciphertext.
-func (prv *PrivateKey) Decrypt(rand io.Reader, c, s1, s2 []byte) (m []byte, err error) {
-	if c == nil || len(c) == 0 {
-		err = ErrInvalidMessage
-		return
+func (prv *PrivateKey) Decrypt(c, s1, s2 []byte) (m []byte, err error) {
+	if len(c) == 0 {
+		return nil, ErrInvalidMessage
 	}
 	params := prv.PublicKey.Params
 	if params == nil {
@@ -313,7 +314,7 @@ func (prv *PrivateKey) Decrypt(rand io.Reader, c, s1, s2 []byte) (m []byte, err 
 
 	switch c[0] {
 	case 2, 3, 4:
-		rLen = ((prv.PublicKey.Curve.Params().BitSize + 7) / 4)
+		rLen = (prv.PublicKey.Curve.Params().BitSize + 7) / 4
 		if len(c) < (rLen + hLen + 1) {
 			err = ErrInvalidMessage
 			return
@@ -360,6 +361,6 @@ func (prv *PrivateKey) Decrypt(rand io.Reader, c, s1, s2 []byte) (m []byte, err 
 		return
 	}
 
-	m, err = symDecrypt(rand, params, Ke, c[mStart:mEnd])
+	m, err = symDecrypt(params, Ke, c[mStart:mEnd])
 	return
 }

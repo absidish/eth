@@ -44,12 +44,15 @@ type UserPrompter interface {
 	PromptConfirm(prompt string) (bool, error)
 
 	// SetHistory sets the the input scrollback history that the prompter will allow
-	// the user to scoll back to.
+	// the user to scroll back to.
 	SetHistory(history []string)
 
 	// AppendHistory appends an entry to the scrollback history. It should be called
 	// if and only if the prompt to append was a valid command.
 	AppendHistory(command string)
+
+	// ClearHistory clears the entire history
+	ClearHistory()
 
 	// SetWordCompleter sets the completion function that the prompter will call to
 	// fetch completion candidates when the user presses tab.
@@ -95,7 +98,7 @@ func newTerminalPrompter() *terminalPrompter {
 	}
 	p.SetCtrlCAborts(true)
 	p.SetTabCompletionStyle(liner.TabPrints)
-
+	p.SetMultiLineMode(true)
 	return p
 }
 
@@ -147,15 +150,19 @@ func (p *terminalPrompter) PromptConfirm(prompt string) (bool, error) {
 }
 
 // SetHistory sets the the input scrollback history that the prompter will allow
-// the user to scoll back to.
+// the user to scroll back to.
 func (p *terminalPrompter) SetHistory(history []string) {
 	p.State.ReadHistory(strings.NewReader(strings.Join(history, "\n")))
 }
 
-// AppendHistory appends an entry to the scrollback history. It should be called
-// if and only if the prompt to append was a valid command.
+// AppendHistory appends an entry to the scrollback history.
 func (p *terminalPrompter) AppendHistory(command string) {
 	p.State.AppendHistory(command)
+}
+
+// ClearHistory clears the entire history
+func (p *terminalPrompter) ClearHistory() {
+	p.State.ClearHistory()
 }
 
 // SetWordCompleter sets the completion function that the prompter will call to

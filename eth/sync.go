@@ -21,12 +21,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ethereumproject/go-ethereum/common"
-	"github.com/ethereumproject/go-ethereum/core/types"
-	"github.com/ethereumproject/go-ethereum/eth/downloader"
-	"github.com/ethereumproject/go-ethereum/logger"
-	"github.com/ethereumproject/go-ethereum/logger/glog"
-	"github.com/ethereumproject/go-ethereum/p2p/discover"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/eth/downloader"
+	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/p2p/discover"
 )
 
 const (
@@ -45,7 +44,11 @@ type txsync struct {
 
 // syncTransactions starts sending all currently pending transactions to the given peer.
 func (pm *ProtocolManager) syncTransactions(p *peer) {
-	txs := pm.txpool.GetTransactions()
+	var txs types.Transactions
+	pending, _ := pm.txpool.Pending()
+	for _, batch := range pending {
+		txs = append(txs, batch...)
+	}
 	if len(txs) == 0 {
 		return
 	}
@@ -83,7 +86,7 @@ func (pm *ProtocolManager) txsyncLoop() {
 			delete(pending, s.p.ID())
 		}
 		// Send the pack in the background.
-		glog.V(logger.Detail).Infof("%v: sending %d transactions (%v)", s.p.Peer, len(pack.txs), size)
+		s.p.Log().Trace("Sending batch of transactions", "count", len(pack.txs), "bytes", size)
 		sending = true
 		go func() { done <- pack.p.SendTransactions(pack.txs) }()
 	}
@@ -113,7 +116,7 @@ func (pm *ProtocolManager) txsyncLoop() {
 			sending = false
 			// Stop tracking peers that cause send failures.
 			if err != nil {
-				glog.V(logger.Debug).Infof("%v: tx send failed: %v", pack.p.Peer, err)
+				pack.p.Log().Debug("Transaction send failed", "err", err)
 				delete(pending, pack.p.ID())
 			}
 			// Schedule the next send.
@@ -149,11 +152,7 @@ func (pm *ProtocolManager) syncer() {
 
 		case <-forceSync.C:
 			// Force a sync even if not enough peers are present
-			if !pm.downloader.Synchronising() {
-				go pm.synchronise(pm.peers.BestPeer())
-			} else {
-				glog.V(logger.Debug).Infoln("forceSync.C: skipping call to synchronise with best peers (dl already syncing)")
-			}
+			go pm.synchronise(pm.peers.BestPeer())
 
 		case <-pm.noMorePeers:
 			return
@@ -167,19 +166,14 @@ func (pm *ProtocolManager) synchronise(peer *peer) {
 	if peer == nil {
 		return
 	}
-
 	// Make sure the peer's TD is higher than our own
 	currentBlock := pm.blockchain.CurrentBlock()
-	td := pm.blockchain.GetTd(currentBlock.Hash())
-	// Stored block's td should never be nil or non-positive.
-	if td == nil || td.Sign() < 1 {
-		glog.Fatalf("Found invalid TD=%v for current block in database. Exiting.\nCheck available disk space and restart to attempt database recovery.", td)
-	}
+	td := pm.blockchain.GetTd(currentBlock.Hash(), currentBlock.NumberU64())
+
 	pHead, pTd := peer.Head()
 	if pTd.Cmp(td) <= 0 {
 		return
 	}
-
 	// Otherwise try to sync with the downloader
 	mode := downloader.FullSync
 	if atomic.LoadUint32(&pm.fastSync) == 1 {
@@ -197,23 +191,20 @@ func (pm *ProtocolManager) synchronise(peer *peer) {
 
 	if mode == downloader.FastSync {
 		// Make sure the peer's total difficulty we are synchronizing is higher.
-		if pm.blockchain.GetTd(pm.blockchain.CurrentFastBlock().Hash()).Cmp(pTd) >= 0 {
+		if pm.blockchain.GetTdByHash(pm.blockchain.CurrentFastBlock().Hash()).Cmp(pTd) >= 0 {
 			return
 		}
 	}
 
 	// Run the sync cycle, and disable fast sync if we've went past the pivot block
 	if err := pm.downloader.Synchronise(peer.id, pHead, pTd, mode); err != nil {
-		glog.V(logger.Info).Infoln("downloader failed to synchronise", "mode=", mode, "peer=", peer.String(), "err=", err.Error())
 		return
 	}
-
-	// If fast sync was enabled, and we synced up, disable it
-	if atomic.CompareAndSwapUint32(&pm.fastSync, 1, 0) {
-		glog.V(logger.Info).Infoln("Fast sync complete, auto disabling")
-		glog.D(logger.Info).Infoln("Fast sync complete, auto disabling")
+	if atomic.LoadUint32(&pm.fastSync) == 1 {
+		log.Info("Fast sync complete, auto disabling")
+		atomic.StoreUint32(&pm.fastSync, 0)
 	}
-	atomic.StoreUint32(&pm.acceptsTxs, 1) // Mark initial sync done
+	atomic.StoreUint32(&pm.acceptTxs, 1) // Mark initial sync done
 	if head := pm.blockchain.CurrentBlock(); head.NumberU64() > 0 {
 		// We've completed a sync cycle, notify all peers of new state. This path is
 		// essential in star-topology networks where a gateway node needs to notify

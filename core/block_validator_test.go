@@ -17,459 +17,183 @@
 package core
 
 import (
-	"math/big"
+	"runtime"
 	"testing"
+	"time"
 
-	"github.com/ethereumproject/ethash"
-
-	"github.com/ethereumproject/go-ethereum/common"
-	"github.com/ethereumproject/go-ethereum/core/state"
-	"github.com/ethereumproject/go-ethereum/core/types"
-	"github.com/ethereumproject/go-ethereum/core/vm"
-	"github.com/ethereumproject/go-ethereum/ethdb"
-	"github.com/ethereumproject/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/consensus/ethash"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/params"
 )
 
-func testChainConfig() *ChainConfig {
-	return &ChainConfig{
-		Forks: []*Fork{
-			{
-				Name:  "Homestead",
-				Block: big.NewInt(0),
-				Features: []*ForkFeature{
-					{
-						ID: "gastable",
-						Options: ChainFeatureConfigOptions{
-							"type": "homestead",
-						},
-					},
-					{
-						ID: "difficulty",
-						Options: ChainFeatureConfigOptions{
-							"type": "homestead",
-						},
-					},
-				},
-			},
-			{
-				Name:  "Diehard",
-				Block: big.NewInt(5),
-				Features: []*ForkFeature{
-					{
-						ID: "eip155",
-						Options: ChainFeatureConfigOptions{
-							"chainID": 62,
-						},
-					},
-					{ // ecip1010 bomb delay
-						ID: "gastable",
-						Options: ChainFeatureConfigOptions{
-							"type": "eip160",
-						},
-					},
-					{ // ecip1010 bomb delay
-						ID: "difficulty",
-						Options: ChainFeatureConfigOptions{
-							"type":   "ecip1010",
-							"length": 2000000,
-						},
-					},
-				},
-			},
-		},
+// Tests that simple header verification works, for both good and bad blocks.
+func TestHeaderVerification(t *testing.T) {
+	// Create a simple chain to verify
+	var (
+		testdb    = ethdb.NewMemDatabase()
+		gspec     = &Genesis{Config: params.TestChainConfig}
+		genesis   = gspec.MustCommit(testdb)
+		blocks, _ = GenerateChain(params.TestChainConfig, genesis, ethash.NewFaker(), testdb, 8, nil)
+	)
+	headers := make([]*types.Header, len(blocks))
+	for i, block := range blocks {
+		headers[i] = block.Header()
+	}
+	// Run the header checker for blocks one-by-one, checking for both valid and invalid nonces
+	chain, _ := NewBlockChain(testdb, nil, params.TestChainConfig, ethash.NewFaker(), vm.Config{})
+	defer chain.Stop()
+
+	for i := 0; i < len(blocks); i++ {
+		for j, valid := range []bool{true, false} {
+			var results <-chan error
+
+			if valid {
+				engine := ethash.NewFaker()
+				_, results = engine.VerifyHeaders(chain, []*types.Header{headers[i]}, []bool{true})
+			} else {
+				engine := ethash.NewFakeFailer(headers[i].Number.Uint64())
+				_, results = engine.VerifyHeaders(chain, []*types.Header{headers[i]}, []bool{true})
+			}
+			// Wait for the verification result
+			select {
+			case result := <-results:
+				if (result == nil) != valid {
+					t.Errorf("test %d.%d: validity mismatch: have %v, want %v", i, j, result, valid)
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("test %d.%d: verification timeout", i, j)
+			}
+			// Make sure no more data is returned
+			select {
+			case result := <-results:
+				t.Fatalf("test %d.%d: unexpected result returned: %v", i, j, result)
+			case <-time.After(25 * time.Millisecond):
+			}
+		}
+		chain.InsertChain(blocks[i : i+1])
 	}
 }
 
-func proc(t testing.TB) (Validator, *BlockChain) {
-	db, err := ethdb.NewMemDatabase()
-	if err != nil {
-		t.Fatal(err)
+// Tests that concurrent header verification works, for both good and bad blocks.
+func TestHeaderConcurrentVerification2(t *testing.T)  { testHeaderConcurrentVerification(t, 2) }
+func TestHeaderConcurrentVerification8(t *testing.T)  { testHeaderConcurrentVerification(t, 8) }
+func TestHeaderConcurrentVerification32(t *testing.T) { testHeaderConcurrentVerification(t, 32) }
+
+func testHeaderConcurrentVerification(t *testing.T, threads int) {
+	// Create a simple chain to verify
+	var (
+		testdb    = ethdb.NewMemDatabase()
+		gspec     = &Genesis{Config: params.TestChainConfig}
+		genesis   = gspec.MustCommit(testdb)
+		blocks, _ = GenerateChain(params.TestChainConfig, genesis, ethash.NewFaker(), testdb, 8, nil)
+	)
+	headers := make([]*types.Header, len(blocks))
+	seals := make([]bool, len(blocks))
+
+	for i, block := range blocks {
+		headers[i] = block.Header()
+		seals[i] = true
 	}
-	_, err = WriteGenesisBlock(db, DefaultConfigMorden.Genesis)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Set the number of threads to verify on
+	old := runtime.GOMAXPROCS(threads)
+	defer runtime.GOMAXPROCS(old)
 
-	pow, err := ethash.NewForTesting()
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Run the header checker for the entire block chain at once both for a valid and
+	// also an invalid chain (enough if one arbitrary block is invalid).
+	for i, valid := range []bool{true, false} {
+		var results <-chan error
 
-	var mux event.TypeMux
-	blockchain, err := NewBlockChain(db, testChainConfig(), pow, &mux)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return blockchain.validator, blockchain
-}
+		if valid {
+			chain, _ := NewBlockChain(testdb, nil, params.TestChainConfig, ethash.NewFaker(), vm.Config{})
+			_, results = chain.engine.VerifyHeaders(chain, headers, seals)
+			chain.Stop()
+		} else {
+			chain, _ := NewBlockChain(testdb, nil, params.TestChainConfig, ethash.NewFakeFailer(uint64(len(headers)-1)), vm.Config{})
+			_, results = chain.engine.VerifyHeaders(chain, headers, seals)
+			chain.Stop()
+		}
+		// Wait for all the verification results
+		checks := make(map[int]error)
+		for j := 0; j < len(blocks); j++ {
+			select {
+			case result := <-results:
+				checks[j] = result
 
-func TestNumber(t *testing.T) {
-	_, chain := proc(t)
-
-	statedb, err := state.New(chain.Genesis().Root(), state.NewDatabase(chain.chainDb))
-	if err != nil {
-		t.Fatal(err)
-	}
-	header := makeHeader(chain.config, chain.Genesis(), statedb)
-	header.Number = big.NewInt(3)
-	cfg := testChainConfig()
-	err = ValidateHeader(cfg, nil, header, chain.Genesis().Header(), false, false)
-	if err != BlockNumberErr {
-		t.Errorf("expected block number error, got %q", err)
-	}
-
-	header = makeHeader(chain.config, chain.Genesis(), statedb)
-	err = ValidateHeader(cfg, nil, header, chain.Genesis().Header(), false, false)
-	if err == BlockNumberErr {
-		t.Errorf("didn't expect block number error")
-	}
-}
-
-func TestPutReceipt(t *testing.T) {
-	db, err := ethdb.NewMemDatabase()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var addr common.Address
-	addr[0] = 1
-	var hash common.Hash
-	hash[0] = 2
-
-	receipt := new(types.Receipt)
-	receipt.Logs = vm.Logs{&vm.Log{
-		Address:     addr,
-		Topics:      []common.Hash{hash},
-		Data:        []byte("hi"),
-		BlockNumber: 42,
-		TxHash:      hash,
-		TxIndex:     0,
-		BlockHash:   hash,
-		Index:       0,
-	}}
-
-	WriteReceipts(db, types.Receipts{receipt})
-	receipt = GetReceipt(db, common.Hash{})
-	if receipt == nil {
-		t.Error("expected to get 1 receipt, got none.")
-	}
-}
-
-func TestDifficultyBombFreeze(t *testing.T) {
-	diehardBlock := big.NewInt(3000000)
-	var parentTime uint64
-
-	// 20 seconds, parent diff 7654414978364
-	parentTime = 1452838500
-	act := calcDifficultyDiehard(parentTime+20, parentTime, big.NewInt(7654414978364), diehardBlock)
-	exp := big.NewInt(7650945906507)
-	if exp.Cmp(act) != 0 {
-		t.Errorf("Expected to have %d difficulty, got %d (difference: %d)",
-			exp, act, big.NewInt(0).Sub(act, exp))
-	}
-
-	// 5 seconds, parent diff 7654414978364
-	act = calcDifficultyDiehard(parentTime+5, parentTime, big.NewInt(7654414978364), diehardBlock)
-	exp = big.NewInt(7658420921133)
-	if exp.Cmp(act) != 0 {
-		t.Errorf("Expected to have %d difficulty, got %d (difference: %d)",
-			exp, act, big.NewInt(0).Sub(act, exp))
-	}
-
-	// 80 seconds, parent diff 7654414978364
-	act = calcDifficultyDiehard(parentTime+80, parentTime, big.NewInt(7654414978364), diehardBlock)
-	exp = big.NewInt(7628520862629)
-	if exp.Cmp(act) != 0 {
-		t.Errorf("Expected to have %d difficulty, got %d (difference: %d)",
-			exp, act, big.NewInt(0).Sub(act, exp))
-	}
-
-	// 76 seconds, parent diff 12657404717367
-	parentTime = 1469081721
-	act = calcDifficultyDiehard(parentTime+76, parentTime, big.NewInt(12657404717367), diehardBlock)
-	exp = big.NewInt(12620590912441)
-	if exp.Cmp(act) != 0 {
-		t.Errorf("Expected to have %d difficulty, got %d (difference: %d)",
-			exp, act, big.NewInt(0).Sub(act, exp))
-	}
-
-	// 1 second, parent diff 12620590912441
-	parentTime = 1469164521
-	act = calcDifficultyDiehard(parentTime+1, parentTime, big.NewInt(12620590912441), diehardBlock)
-	exp = big.NewInt(12627021745803)
-	if exp.Cmp(act) != 0 {
-		t.Errorf("Expected to have %d difficulty, got %d (difference: %d)",
-			exp, act, big.NewInt(0).Sub(act, exp))
-	}
-
-	// 10 seconds, parent diff 12627021745803
-	parentTime = 1469164522
-	act = calcDifficultyDiehard(parentTime+10, parentTime, big.NewInt(12627021745803), diehardBlock)
-	exp = big.NewInt(12627290181259)
-	if exp.Cmp(act) != 0 {
-		t.Errorf("Expected to have %d difficulty, got %d (difference: %d)",
-			exp, act, big.NewInt(0).Sub(act, exp))
-	}
-
-}
-
-func TestDifficultyBombFreezeTestnet(t *testing.T) {
-	diehardBlock := big.NewInt(1915000)
-
-	act := calcDifficultyDiehard(1481895639, 1481850947, big.NewInt(28670444), diehardBlock)
-	exp := big.NewInt(27415615)
-	if exp.Cmp(act) != 0 {
-		t.Errorf("Expected to have %d difficulty, got %d (difference: %d)",
-			exp, act, big.NewInt(0).Sub(act, exp))
-	}
-}
-
-func TestDifficultyBombExplode(t *testing.T) {
-	diehardBlock := big.NewInt(3000000)
-	explosionBlock := big.NewInt(5000000)
-
-	var parentTime uint64
-
-	// 6 seconds, blocks in 5m
-	num := big.NewInt(5000102)
-	parentTime = 1513175023
-	act := calcDifficultyExplosion(parentTime+6, parentTime, num, big.NewInt(22627021745803), diehardBlock, explosionBlock)
-	exp := big.NewInt(22638338531720)
-	if exp.Cmp(act) != 0 {
-		t.Errorf("Expected to have %d difficulty, got %d (difference: %d)",
-			exp, act, big.NewInt(0).Sub(act, exp))
-	}
-
-	num = big.NewInt(5001105)
-	parentTime = 1513189406
-	act = calcDifficultyExplosion(parentTime+29, parentTime, num, big.NewInt(22727021745803), diehardBlock, explosionBlock)
-	exp = big.NewInt(22716193002673)
-	if exp.Cmp(act) != 0 {
-		t.Errorf("Expected to have %d difficulty, got %d (difference: %d)",
-			exp, act, big.NewInt(0).Sub(act, exp))
-	}
-
-	num = big.NewInt(5100123)
-	parentTime = 1514609324
-	act = calcDifficultyExplosion(parentTime+41, parentTime, num, big.NewInt(22893437765583), diehardBlock, explosionBlock)
-	exp = big.NewInt(22860439327271)
-	if exp.Cmp(act) != 0 {
-		t.Errorf("Expected to have %d difficulty, got %d (difference: %d)",
-			exp, act, big.NewInt(0).Sub(act, exp))
-	}
-
-	num = big.NewInt(6150001)
-	parentTime = 1529664575
-	act = calcDifficultyExplosion(parentTime+105, parentTime, num, big.NewInt(53134780363303), diehardBlock, explosionBlock)
-	exp = big.NewInt(53451033724425)
-	if exp.Cmp(act) != 0 {
-		t.Errorf("Expected to have %d difficulty, got %d (difference: %d)",
-			exp, act, big.NewInt(0).Sub(act, exp))
-	}
-
-	num = big.NewInt(6550001)
-	parentTime = 1535431724
-	act = calcDifficultyExplosion(parentTime+60, parentTime, num, big.NewInt(82893437765583), diehardBlock, explosionBlock)
-	exp = big.NewInt(91487154230751)
-	if exp.Cmp(act) != 0 {
-		t.Errorf("Expected to have %d difficulty, got %d (difference: %d)",
-			exp, act, big.NewInt(0).Sub(act, exp))
-	}
-
-	num = big.NewInt(7000000)
-	parentTime = 1535431724
-	act = calcDifficultyExplosion(parentTime+180, parentTime, num, big.NewInt(304334879167015), diehardBlock, explosionBlock)
-	exp = big.NewInt(583283638618965)
-	if exp.Cmp(act) != 0 {
-		t.Errorf("Expected to have %d difficulty, got %d (difference: %d)",
-			exp, act, big.NewInt(0).Sub(act, exp))
-	}
-
-	num = big.NewInt(8000000)
-	parentTime = 1535431724
-	act = calcDifficultyExplosion(parentTime+420, parentTime, num, big.NewInt(78825323605416810), diehardBlock, explosionBlock)
-	exp = big.NewInt(365477653727918567)
-	if exp.Cmp(act) != 0 {
-		t.Errorf("Expected to have %d difficulty, got %d (difference: %d)",
-			exp, act, big.NewInt(0).Sub(act, exp))
-	}
-
-	num = big.NewInt(9000000)
-	parentTime = 1535431724
-	act = calcDifficultyExplosion(parentTime+2040, parentTime, num, big.NewInt(288253236054168103), diehardBlock, explosionBlock)
-	exp = big.NewInt(0)
-	exp.SetString("295422224299015703633", 10)
-	if exp.Cmp(act) != 0 {
-		t.Errorf("Expected to have %d difficulty, got %d (difference: %d)",
-			exp, act, big.NewInt(0).Sub(act, exp))
-	}
-}
-
-func TestDifficultyBombExplodeTestnet(t *testing.T) {
-	diehardBlock := big.NewInt(1915000)
-	explosionBlock := big.NewInt(3415000)
-
-	var parentTime uint64
-	parentTime = 1513175023
-	act := calcDifficultyExplosion(parentTime+20, parentTime, big.NewInt(5200000), big.NewInt(28670444), diehardBlock, explosionBlock)
-	exp := big.NewInt(34388394813)
-	if exp.Cmp(act) != 0 {
-		t.Errorf("Expected to have %d difficulty, got %d (difference: %d)",
-			exp, act, big.NewInt(0).Sub(act, exp))
-	}
-}
-
-// Compare expected difficulties on edges of forks.
-func TestCalcDifficulty1Mainnet(t *testing.T) {
-	config := DefaultConfigMainnet.ChainConfig
-
-	parentTime := uint64(1513175023)
-	time := parentTime + 20
-	parentDiff := big.NewInt(28670444)
-
-	dhB := config.ForkByName("Diehard").Block
-	if dhB == nil {
-		t.Error("missing Diehard fork block")
-	}
-
-	feat, dhFork, configured := config.GetFeature(dhB, "difficulty")
-	if !configured {
-		t.Errorf("difficulty not configured for diehard block: %v", dhB)
-	}
-	if val, ok := feat.GetString("type"); !ok || val != "ecip1010" {
-		t.Errorf("ecip1010 not configured as difficulty for diehard block: %v", dhB)
-	}
-	delay, ok := feat.GetBigInt("length")
-	if !ok {
-		t.Error("ecip1010 bomb delay length not configured")
-	}
-
-	// Paradise
-	defuseBlock := config.ForkByName("Defuse Difficulty Bomb").Block
-	if defuseBlock == nil {
-		t.Error("missing Defuse Difficulty Bomb fork block")
-	}
-
-	defuseFeat, _, defuseConfigured := config.GetFeature(defuseBlock, "difficulty")
-	if !defuseConfigured {
-		t.Errorf("difficulty not configured for Defuse Difficulty Bomb block: %v", dhB)
-	}
-	if val, ok := defuseFeat.GetString("type"); !ok || val != "defused" {
-		t.Errorf("diffusion not configured as difficulty for Defuse Difficulty Bomb block: %v", dhB)
-	}
-
-	explosionBlock := big.NewInt(0).Add(dhB, delay)
-
-	//parentBlocks to compare with expected equality
-	table := map[*big.Int]*big.Int{
-
-		big.NewInt(0).Add(config.ForkByName("Homestead").Block, big.NewInt(-2)): calcDifficultyFrontier(time, parentTime, big.NewInt(0).Add(config.ForkByName("Homestead").Block, big.NewInt(-2)), parentDiff),
-		big.NewInt(0).Add(config.ForkByName("Homestead").Block, big.NewInt(-1)): calcDifficultyHomestead(time, parentTime, big.NewInt(0).Add(config.ForkByName("Homestead").Block, big.NewInt(-1)), parentDiff),
-		big.NewInt(0).Add(config.ForkByName("Homestead").Block, big.NewInt(0)):  calcDifficultyHomestead(time, parentTime, big.NewInt(0).Add(config.ForkByName("Homestead").Block, big.NewInt(0)), parentDiff),
-		big.NewInt(0).Add(config.ForkByName("Homestead").Block, big.NewInt(1)):  calcDifficultyHomestead(time, parentTime, big.NewInt(0).Add(config.ForkByName("Homestead").Block, big.NewInt(1)), parentDiff),
-
-		big.NewInt(0).Add(config.ForkByName("The DAO Hard Fork").Block, big.NewInt(-2)): calcDifficultyHomestead(time, parentTime, big.NewInt(0).Add(config.ForkByName("The DAO Hard Fork").Block, big.NewInt(-2)), parentDiff),
-		big.NewInt(0).Add(config.ForkByName("The DAO Hard Fork").Block, big.NewInt(-1)): calcDifficultyHomestead(time, parentTime, big.NewInt(0).Add(config.ForkByName("The DAO Hard Fork").Block, big.NewInt(-1)), parentDiff),
-		big.NewInt(0).Add(config.ForkByName("The DAO Hard Fork").Block, big.NewInt(0)):  calcDifficultyHomestead(time, parentTime, big.NewInt(0).Add(config.ForkByName("The DAO Hard Fork").Block, big.NewInt(0)), parentDiff),
-		big.NewInt(0).Add(config.ForkByName("The DAO Hard Fork").Block, big.NewInt(1)):  calcDifficultyHomestead(time, parentTime, big.NewInt(0).Add(config.ForkByName("The DAO Hard Fork").Block, big.NewInt(1)), parentDiff),
-
-		big.NewInt(0).Add(config.ForkByName("GasReprice").Block, big.NewInt(-2)): calcDifficultyHomestead(time, parentTime, big.NewInt(0).Add(config.ForkByName("GasReprice").Block, big.NewInt(-2)), parentDiff),
-		big.NewInt(0).Add(config.ForkByName("GasReprice").Block, big.NewInt(-1)): calcDifficultyHomestead(time, parentTime, big.NewInt(0).Add(config.ForkByName("GasReprice").Block, big.NewInt(-1)), parentDiff),
-		big.NewInt(0).Add(config.ForkByName("GasReprice").Block, big.NewInt(0)):  calcDifficultyHomestead(time, parentTime, big.NewInt(0).Add(config.ForkByName("GasReprice").Block, big.NewInt(0)), parentDiff),
-		big.NewInt(0).Add(config.ForkByName("GasReprice").Block, big.NewInt(1)):  calcDifficultyHomestead(time, parentTime, big.NewInt(0).Add(config.ForkByName("GasReprice").Block, big.NewInt(1)), parentDiff),
-
-		big.NewInt(0).Add(dhB, big.NewInt(-1)): calcDifficultyDiehard(time, parentTime, parentDiff, dhFork.Block), // 2999999
-		big.NewInt(0).Add(dhB, big.NewInt(0)):  calcDifficultyDiehard(time, parentTime, parentDiff, dhFork.Block), // 3000000
-		big.NewInt(0).Add(dhB, big.NewInt(1)):  calcDifficultyDiehard(time, parentTime, parentDiff, dhFork.Block), // 3000001
-		big.NewInt(-2).Add(dhB, delay):         calcDifficultyDiehard(time, parentTime, parentDiff, dhFork.Block), // 4999998
-
-		big.NewInt(-1).Add(dhB, delay): calcDifficultyExplosion(time, parentTime, big.NewInt(-1).Add(dhB, delay), parentDiff, dhFork.Block, explosionBlock), // 4999999
-		big.NewInt(0).Add(dhB, delay):  calcDifficultyExplosion(time, parentTime, big.NewInt(0).Add(dhB, delay), parentDiff, dhFork.Block, explosionBlock),  // 5000000
-		big.NewInt(1).Add(dhB, delay):  calcDifficultyExplosion(time, parentTime, big.NewInt(1).Add(dhB, delay), parentDiff, dhFork.Block, explosionBlock),  // 5000001
-
-		new(big.Int).Add(defuseBlock, big.NewInt(-1)): calcDifficultyDefused(time, parentTime, new(big.Int).Add(defuseBlock, big.NewInt(-1)), parentDiff),
-		new(big.Int).Add(defuseBlock, big.NewInt(0)):  calcDifficultyDefused(time, parentTime, new(big.Int).Add(defuseBlock, big.NewInt(0)), parentDiff),
-		new(big.Int).Add(defuseBlock, big.NewInt(1)):  calcDifficultyDefused(time, parentTime, new(big.Int).Add(defuseBlock, big.NewInt(1)), parentDiff),
-
-		big.NewInt(10000000): calcDifficultyDefused(time, parentTime, big.NewInt(10000000), parentDiff),
-	}
-
-	for parentNum, expected := range table {
-		difficulty := CalcDifficulty(config, time, parentTime, parentNum, parentDiff)
-		if difficulty.Cmp(expected) != 0 {
-			t.Errorf("config: %v, got: %v, want: %v, with parentBlock: %v", "mainnet", difficulty, expected, parentNum)
+			case <-time.After(time.Second):
+				t.Fatalf("test %d.%d: verification timeout", i, j)
+			}
+		}
+		// Check nonce check validity
+		for j := 0; j < len(blocks); j++ {
+			want := valid || (j < len(blocks)-2) // We chose the last-but-one nonce in the chain to fail
+			if (checks[j] == nil) != want {
+				t.Errorf("test %d.%d: validity mismatch: have %v, want %v", i, j, checks[j], want)
+			}
+			if !want {
+				// A few blocks after the first error may pass verification due to concurrent
+				// workers. We don't care about those in this test, just that the correct block
+				// errors out.
+				break
+			}
+		}
+		// Make sure no more data is returned
+		select {
+		case result := <-results:
+			t.Fatalf("test %d: unexpected result returned: %v", i, result)
+		case <-time.After(25 * time.Millisecond):
 		}
 	}
 }
 
-// Compare expected difficulties on edges of forks.
-func TestCalcDifficulty1Morden(t *testing.T) {
-	config := DefaultConfigMainnet.ChainConfig
+// Tests that aborting a header validation indeed prevents further checks from being
+// run, as well as checks that no left-over goroutines are leaked.
+func TestHeaderConcurrentAbortion2(t *testing.T)  { testHeaderConcurrentAbortion(t, 2) }
+func TestHeaderConcurrentAbortion8(t *testing.T)  { testHeaderConcurrentAbortion(t, 8) }
+func TestHeaderConcurrentAbortion32(t *testing.T) { testHeaderConcurrentAbortion(t, 32) }
 
-	parentTime := uint64(1513175023)
-	time := parentTime + 20
-	parentDiff := big.NewInt(28670444)
+func testHeaderConcurrentAbortion(t *testing.T, threads int) {
+	// Create a simple chain to verify
+	var (
+		testdb    = ethdb.NewMemDatabase()
+		gspec     = &Genesis{Config: params.TestChainConfig}
+		genesis   = gspec.MustCommit(testdb)
+		blocks, _ = GenerateChain(params.TestChainConfig, genesis, ethash.NewFaker(), testdb, 1024, nil)
+	)
+	headers := make([]*types.Header, len(blocks))
+	seals := make([]bool, len(blocks))
 
-	dhB := config.ForkByName("Diehard").Block
-	if dhB == nil {
-		t.Error("missing Diehard fork block")
+	for i, block := range blocks {
+		headers[i] = block.Header()
+		seals[i] = true
 	}
+	// Set the number of threads to verify on
+	old := runtime.GOMAXPROCS(threads)
+	defer runtime.GOMAXPROCS(old)
 
-	feat, dhFork, configured := config.GetFeature(dhB, "difficulty")
-	if !configured {
-		t.Errorf("difficulty not configured for diehard block: %v", dhB)
-	}
-	if val, ok := feat.GetString("type"); !ok || val != "ecip1010" {
-		t.Errorf("ecip1010 not configured as difficulty for diehard block: %v", dhB)
-	}
+	// Start the verifications and immediately abort
+	chain, _ := NewBlockChain(testdb, nil, params.TestChainConfig, ethash.NewFakeDelayer(time.Millisecond), vm.Config{})
+	defer chain.Stop()
 
-	// Paradise
-	defuseBlock := config.ForkByName("Defuse Difficulty Bomb").Block
-	if defuseBlock == nil {
-		t.Error("missing Defuse Difficulty Bomb fork block")
-	}
+	abort, results := chain.engine.VerifyHeaders(chain, headers, seals)
+	close(abort)
 
-	defuseFeat, _, defuseConfigured := config.GetFeature(defuseBlock, "difficulty")
-	if !defuseConfigured {
-		t.Errorf("difficulty not configured for Defuse Difficulty Bomb block: %v", dhB)
-	}
-	if val, ok := defuseFeat.GetString("type"); !ok || val != "defused" {
-		t.Errorf("diffusion not configured as difficulty for Defuse Difficulty Bomb block: %v", dhB)
-	}
-
-	//parentBlocks to compare with expected equality
-	table := map[*big.Int]*big.Int{
-
-		big.NewInt(0).Add(config.ForkByName("Homestead").Block, big.NewInt(-2)): calcDifficultyFrontier(time, parentTime, big.NewInt(0).Add(config.ForkByName("Homestead").Block, big.NewInt(-2)), parentDiff),
-		big.NewInt(0).Add(config.ForkByName("Homestead").Block, big.NewInt(-1)): calcDifficultyHomestead(time, parentTime, big.NewInt(0).Add(config.ForkByName("Homestead").Block, big.NewInt(-1)), parentDiff),
-		big.NewInt(0).Add(config.ForkByName("Homestead").Block, big.NewInt(0)):  calcDifficultyHomestead(time, parentTime, big.NewInt(0).Add(config.ForkByName("Homestead").Block, big.NewInt(0)), parentDiff),
-		big.NewInt(0).Add(config.ForkByName("Homestead").Block, big.NewInt(1)):  calcDifficultyHomestead(time, parentTime, big.NewInt(0).Add(config.ForkByName("Homestead").Block, big.NewInt(1)), parentDiff),
-
-		big.NewInt(0).Add(config.ForkByName("The DAO Hard Fork").Block, big.NewInt(-2)): calcDifficultyHomestead(time, parentTime, big.NewInt(0).Add(config.ForkByName("The DAO Hard Fork").Block, big.NewInt(-2)), parentDiff),
-		big.NewInt(0).Add(config.ForkByName("The DAO Hard Fork").Block, big.NewInt(-1)): calcDifficultyHomestead(time, parentTime, big.NewInt(0).Add(config.ForkByName("The DAO Hard Fork").Block, big.NewInt(-1)), parentDiff),
-		big.NewInt(0).Add(config.ForkByName("The DAO Hard Fork").Block, big.NewInt(0)):  calcDifficultyHomestead(time, parentTime, big.NewInt(0).Add(config.ForkByName("The DAO Hard Fork").Block, big.NewInt(0)), parentDiff),
-		big.NewInt(0).Add(config.ForkByName("The DAO Hard Fork").Block, big.NewInt(1)):  calcDifficultyHomestead(time, parentTime, big.NewInt(0).Add(config.ForkByName("The DAO Hard Fork").Block, big.NewInt(1)), parentDiff),
-
-		big.NewInt(0).Add(config.ForkByName("GasReprice").Block, big.NewInt(-2)): calcDifficultyHomestead(time, parentTime, big.NewInt(0).Add(config.ForkByName("GasReprice").Block, big.NewInt(-2)), parentDiff),
-		big.NewInt(0).Add(config.ForkByName("GasReprice").Block, big.NewInt(-1)): calcDifficultyHomestead(time, parentTime, big.NewInt(0).Add(config.ForkByName("GasReprice").Block, big.NewInt(-1)), parentDiff),
-		big.NewInt(0).Add(config.ForkByName("GasReprice").Block, big.NewInt(0)):  calcDifficultyHomestead(time, parentTime, big.NewInt(0).Add(config.ForkByName("GasReprice").Block, big.NewInt(0)), parentDiff),
-		big.NewInt(0).Add(config.ForkByName("GasReprice").Block, big.NewInt(1)):  calcDifficultyHomestead(time, parentTime, big.NewInt(0).Add(config.ForkByName("GasReprice").Block, big.NewInt(1)), parentDiff),
-
-		big.NewInt(0).Add(dhB, big.NewInt(-1)): calcDifficultyDiehard(time, parentTime, parentDiff, dhFork.Block), // 2999999
-		big.NewInt(0).Add(dhB, big.NewInt(0)):  calcDifficultyDiehard(time, parentTime, parentDiff, dhFork.Block), // 3000000
-		big.NewInt(0).Add(dhB, big.NewInt(1)):  calcDifficultyDiehard(time, parentTime, parentDiff, dhFork.Block), // 3000001
-
-		new(big.Int).Add(defuseBlock, big.NewInt(-1)): calcDifficultyDefused(time, parentTime, new(big.Int).Add(defuseBlock, big.NewInt(-1)), parentDiff),
-		new(big.Int).Add(defuseBlock, big.NewInt(0)):  calcDifficultyDefused(time, parentTime, new(big.Int).Add(defuseBlock, big.NewInt(0)), parentDiff),
-		new(big.Int).Add(defuseBlock, big.NewInt(1)):  calcDifficultyDefused(time, parentTime, new(big.Int).Add(defuseBlock, big.NewInt(1)), parentDiff),
-
-		big.NewInt(10000000): calcDifficultyDefused(time, parentTime, big.NewInt(10000000), parentDiff),
-	}
-
-	for parentNum, expected := range table {
-		difficulty := CalcDifficulty(config, time, parentTime, parentNum, parentDiff)
-		if difficulty.Cmp(expected) != 0 {
-			t.Errorf("config: %v, got: %v, want: %v, with parentBlock: %v", "mainnet", difficulty, expected, parentNum)
+	// Deplete the results channel
+	verified := 0
+	for depleted := false; !depleted; {
+		select {
+		case result := <-results:
+			if result != nil {
+				t.Errorf("header %d: validation failed: %v", verified, result)
+			}
+			verified++
+		case <-time.After(50 * time.Millisecond):
+			depleted = true
 		}
+	}
+	// Check that abortion was honored by not processing too many POWs
+	if verified > 2*threads {
+		t.Errorf("verification count too large: have %d, want below %d", verified, 2*threads)
 	}
 }

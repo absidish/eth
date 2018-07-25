@@ -19,17 +19,13 @@ package fetcher
 
 import (
 	"errors"
-	"fmt"
 	"math/rand"
 	"time"
 
-	"github.com/ethereumproject/go-ethereum/common"
-	"github.com/ethereumproject/go-ethereum/core"
-	"github.com/ethereumproject/go-ethereum/core/types"
-	"github.com/ethereumproject/go-ethereum/event"
-	"github.com/ethereumproject/go-ethereum/logger"
-	"github.com/ethereumproject/go-ethereum/logger/glog"
-	"github.com/ethereumproject/go-ethereum/metrics"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/log"
 	"gopkg.in/karalabe/cookiejar.v2/collections/prque"
 )
 
@@ -66,7 +62,7 @@ type blockBroadcasterFn func(block *types.Block, propagate bool)
 type chainHeightFn func() uint64
 
 // chainInsertFn is a callback type to insert a batch of blocks into the local chain.
-type chainInsertFn func(types.Blocks) *core.ChainInsertResult
+type chainInsertFn func(types.Blocks) (int, error)
 
 // peerDropFn is a callback type for dropping a peer detected as malicious.
 type peerDropFn func(id string)
@@ -81,8 +77,8 @@ type announce struct {
 
 	origin string // Identifier of the peer originating the notification
 
-	fetchHeader headerRequesterFn // [eth/62] Fetcher function to retrieve the header of an announced block
-	fetchBodies bodyRequesterFn   // [eth/62] Fetcher function to retrieve the body of an announced block
+	fetchHeader headerRequesterFn // Fetcher function to retrieve the header of an announced block
+	fetchBodies bodyRequesterFn   // Fetcher function to retrieve the body of an announced block
 }
 
 // headerFilterTask represents a batch of headers needing fetcher filtering.
@@ -92,7 +88,7 @@ type headerFilterTask struct {
 	time    time.Time       // Arrival time of the headers
 }
 
-// headerFilterTask represents a batch of block bodies (transactions and uncles)
+// bodyFilterTask represents a batch of block bodies (transactions and uncles)
 // needing fetcher filtering.
 type bodyFilterTask struct {
 	peer         string                 // The source peer of block bodies
@@ -120,9 +116,6 @@ type Fetcher struct {
 
 	done chan common.Hash
 	quit chan struct{}
-
-	// Mux
-	mux *event.TypeMux
 
 	// Announce states
 	announces  map[string]int              // Per peer announce counts to prevent memory exhaustion
@@ -153,9 +146,8 @@ type Fetcher struct {
 }
 
 // New creates a block fetcher to retrieve blocks based on hash announcements.
-func New(mux *event.TypeMux, getBlock blockRetrievalFn, verifyHeader headerVerifierFn, broadcastBlock blockBroadcasterFn, chainHeight chainHeightFn, insertChain chainInsertFn, dropPeer peerDropFn) *Fetcher {
+func New(getBlock blockRetrievalFn, verifyHeader headerVerifierFn, broadcastBlock blockBroadcasterFn, chainHeight chainHeightFn, insertChain chainInsertFn, dropPeer peerDropFn) *Fetcher {
 	return &Fetcher{
-		mux:            mux,
 		notify:         make(chan *announce),
 		inject:         make(chan *inject),
 		blockFilter:    make(chan chan []*types.Block),
@@ -212,7 +204,7 @@ func (f *Fetcher) Notify(peer string, hash common.Hash, number uint64, time time
 	}
 }
 
-// Enqueue tries to fill gaps in the fetcher's future import queue.
+// Enqueue tries to fill gaps the the fetcher's future import queue.
 func (f *Fetcher) Enqueue(peer string, block *types.Block) error {
 	op := &inject{
 		origin: peer,
@@ -229,7 +221,7 @@ func (f *Fetcher) Enqueue(peer string, block *types.Block) error {
 // FilterHeaders extracts all the headers that were explicitly requested by the fetcher,
 // returning those that should be handled differently.
 func (f *Fetcher) FilterHeaders(peer string, headers []*types.Header, time time.Time) []*types.Header {
-	glog.V(logger.Detail).Infof("[eth/62] filtering %d headers", len(headers))
+	log.Trace("Filtering headers", "peer", peer, "headers", len(headers))
 
 	// Send the filter channel to the fetcher
 	filter := make(chan *headerFilterTask)
@@ -257,7 +249,7 @@ func (f *Fetcher) FilterHeaders(peer string, headers []*types.Header, time time.
 // FilterBodies extracts all the block bodies that were explicitly requested by
 // the fetcher, returning those that should be handled differently.
 func (f *Fetcher) FilterBodies(peer string, transactions [][]*types.Transaction, uncles [][]*types.Header, time time.Time) ([][]*types.Transaction, [][]*types.Header) {
-	glog.V(logger.Detail).Infof("[eth/62] filtering %d:%d bodies", len(transactions), len(uncles))
+	log.Trace("Filtering bodies", "peer", peer, "txs", len(transactions), "uncles", len(uncles))
 
 	// Send the filter channel to the fetcher
 	filter := make(chan *bodyFilterTask)
@@ -328,27 +320,19 @@ func (f *Fetcher) loop() {
 
 		case notification := <-f.notify:
 			// A block was announced, make sure the peer isn't DOSing us
-			metrics.FetchAnnounces.Mark(1)
+			propAnnounceInMeter.Mark(1)
 
 			count := f.announces[notification.origin] + 1
 			if count > hashLimit {
-				glog.V(logger.Debug).Infof("Peer %s: exceeded outstanding announces (%d)", notification.origin, hashLimit)
-				metrics.FetchAnnounceDOS.Mark(1)
+				log.Debug("Peer exceeded outstanding announces", "peer", notification.origin, "limit", hashLimit)
+				propAnnounceDOSMeter.Mark(1)
 				break
 			}
 			// If we have a valid block number, check that it's potentially useful
 			if notification.number > 0 {
 				if dist := int64(notification.number) - int64(f.chainHeight()); dist < -maxUncleDist || dist > maxQueueDist {
-					if logger.MlogEnabled() {
-						mlogFetcherDiscardAnnouncement.AssignDetails(
-							notification.origin,
-							notification.number,
-							notification.hash.Hex(),
-							dist,
-						).Send(mlogFetcher)
-					}
-					glog.V(logger.Debug).Infof("[eth/62] Peer %s: discarded announcement #%d [%s], distance %d", notification.origin, notification.number, notification.hash.Hex(), dist)
-					metrics.FetchAnnounceDrops.Mark(1)
+					log.Debug("Peer discarded announcement", "peer", notification.origin, "number", notification.number, "hash", notification.hash, "distance", dist)
+					propAnnounceDropMeter.Mark(1)
 					break
 				}
 			}
@@ -370,7 +354,7 @@ func (f *Fetcher) loop() {
 
 		case op := <-f.inject:
 			// A direct block insertion was requested, try and fill any pending gaps
-			metrics.FetchBroadcasts.Mark(1)
+			propBroadcastInMeter.Mark(1)
 			f.enqueue(op.origin, op.block)
 
 		case hash := <-f.done:
@@ -395,16 +379,10 @@ func (f *Fetcher) loop() {
 					}
 				}
 			}
-			// Send out all block (eth/61) or header (eth/62) requests
+			// Send out all block header requests
 			for peer, hashes := range request {
-				if glog.V(logger.Detail) && len(hashes) > 0 {
-					list := "["
-					for _, hash := range hashes {
-						list += fmt.Sprintf("%x…, ", hash[:4])
-					}
-					list = list[:len(list)-2] + "]"
-					glog.V(logger.Detail).Infof("[eth/62] Peer %s: fetching headers %s", peer, list)
-				}
+				log.Trace("Fetching scheduled headers", "peer", peer, "list", hashes)
+
 				// Create a closure of the fetch and schedule in on a new thread
 				fetchHeader, hashes := f.fetching[hashes[0]].fetchHeader, hashes
 				go func() {
@@ -412,7 +390,7 @@ func (f *Fetcher) loop() {
 						f.fetchingHook(hashes)
 					}
 					for _, hash := range hashes {
-						metrics.FetchHeaders.Mark(1)
+						headerFetchMeter.Mark(1)
 						fetchHeader(hash) // Suboptimal, but protocol doesn't allow batch header retrievals
 					}
 				}()
@@ -437,20 +415,13 @@ func (f *Fetcher) loop() {
 			}
 			// Send out all block body requests
 			for peer, hashes := range request {
-				if glog.V(logger.Detail) && len(hashes) > 0 {
-					list := "["
-					for _, hash := range hashes {
-						list += fmt.Sprintf("%x…, ", hash[:4])
-					}
-					list = list[:len(list)-2] + "]"
+				log.Trace("Fetching scheduled bodies", "peer", peer, "list", hashes)
 
-					glog.V(logger.Detail).Infof("[eth/62] Peer %s: fetching bodies %s", peer, list)
-				}
 				// Create a closure of the fetch and schedule in on a new thread
 				if f.completingHook != nil {
 					f.completingHook(hashes)
 				}
-				metrics.FetchBodies.Mark(int64(len(hashes)))
+				bodyFetchMeter.Mark(int64(len(hashes)))
 				go f.completing[hashes[0]].fetchBodies(hashes)
 			}
 			// Schedule the next fetch if blocks are still pending
@@ -466,7 +437,7 @@ func (f *Fetcher) loop() {
 			case <-f.quit:
 				return
 			}
-			metrics.FetchFilterHeaderIns.Mark(int64(len(task.headers)))
+			headerFilterInMeter.Mark(int64(len(task.headers)))
 
 			// Split the batch of headers into unknown ones (to return to the caller),
 			// known incomplete ones (requiring body retrievals) and completed blocks.
@@ -475,16 +446,10 @@ func (f *Fetcher) loop() {
 				hash := header.Hash()
 
 				// Filter fetcher-requested headers from other synchronisation algorithms
-				announce := f.fetching[hash]
-				cond := announce != nil &&
-					announce.origin == task.peer &&
-					f.fetched[hash] == nil &&
-					f.completing[hash] == nil &&
-					f.queued[hash] == nil
-				if cond {
+				if announce := f.fetching[hash]; announce != nil && announce.origin == task.peer && f.fetched[hash] == nil && f.completing[hash] == nil && f.queued[hash] == nil {
 					// If the delivered header does not match the promised number, drop the announcer
 					if header.Number.Uint64() != announce.number {
-						glog.V(logger.Detail).Infof("[eth/62] Peer %s: invalid block number for [%s]: announced %d, provided %d", announce.origin, header.Hash().Hex(), announce.number, header.Number.Uint64())
+						log.Trace("Invalid block number fetched", "peer", announce.origin, "hash", header.Hash(), "announced", announce.number, "provided", header.Number)
 						f.dropPeer(announce.origin)
 						f.forgetHash(hash)
 						continue
@@ -495,10 +460,8 @@ func (f *Fetcher) loop() {
 						announce.time = task.time
 
 						// If the block is empty (header only), short circuit into the final import queue
-						blockEmpty := header.TxHash == types.DeriveSha(types.Transactions{}) &&
-							header.UncleHash == types.CalcUncleHash([]*types.Header{})
-						if blockEmpty {
-							glog.V(logger.Detail).Infof("[eth/62] Peer %s: block #%d [%s] empty, skipping body retrieval", announce.origin, header.Number.Uint64(), header.Hash().Hex())
+						if header.TxHash == types.DeriveSha(types.Transactions{}) && header.UncleHash == types.CalcUncleHash([]*types.Header{}) {
+							log.Trace("Block empty, skipping body retrieval", "peer", announce.origin, "number", header.Number, "hash", header.Hash())
 
 							block := types.NewBlockWithHeader(header)
 							block.ReceivedAt = task.time
@@ -510,7 +473,7 @@ func (f *Fetcher) loop() {
 						// Otherwise add to the list of blocks needing completion
 						incomplete = append(incomplete, announce)
 					} else {
-						glog.V(logger.Detail).Infof("[eth/62] Peer %s: block #%d [%s] already imported, discarding header", announce.origin, header.Number.Uint64(), header.Hash().Hex())
+						log.Trace("Block already imported, discarding header", "peer", announce.origin, "number", header.Number, "hash", header.Hash())
 						f.forgetHash(hash)
 					}
 				} else {
@@ -518,7 +481,7 @@ func (f *Fetcher) loop() {
 					unknown = append(unknown, header)
 				}
 			}
-			metrics.FetchFilterHeaderOuts.Mark(int64(len(unknown)))
+			headerFilterOutMeter.Mark(int64(len(unknown)))
 			select {
 			case filter <- &headerFilterTask{headers: unknown, time: task.time}:
 			case <-f.quit:
@@ -550,7 +513,7 @@ func (f *Fetcher) loop() {
 			case <-f.quit:
 				return
 			}
-			metrics.FetchFilterBodyIns.Mark(int64(len(task.transactions)))
+			bodyFilterInMeter.Mark(int64(len(task.transactions)))
 
 			blocks := []*types.Block{}
 			for i := 0; i < len(task.transactions) && i < len(task.uncles); i++ {
@@ -585,7 +548,7 @@ func (f *Fetcher) loop() {
 				}
 			}
 
-			metrics.FetchFilterBodyOuts.Mark(int64(len(task.transactions)))
+			bodyFilterOutMeter.Mark(int64(len(task.transactions)))
 			select {
 			case filter <- task:
 			case <-f.quit:
@@ -641,30 +604,15 @@ func (f *Fetcher) enqueue(peer string, block *types.Block) {
 	// Ensure the peer isn't DOSing us
 	count := f.queues[peer] + 1
 	if count > blockLimit {
-		glog.V(logger.Debug).Infof("Peer %s: discarded block #%d [%s], exceeded allowance (%d)", peer, block.NumberU64(), hash.Hex(), blockLimit)
-		metrics.FetchBroadcastDOS.Mark(1)
+		log.Debug("Discarded propagated block, exceeded allowance", "peer", peer, "number", block.Number(), "hash", hash, "limit", blockLimit)
+		propBroadcastDOSMeter.Mark(1)
 		f.forgetHash(hash)
 		return
 	}
 	// Discard any past or too distant blocks
 	if dist := int64(block.NumberU64()) - int64(f.chainHeight()); dist < -maxUncleDist || dist > maxQueueDist {
-		if logger.MlogEnabled() {
-			mlogFetcherDiscardAnnouncement.AssignDetails(
-				peer,
-				block.NumberU64(),
-				hash.Hex(),
-				dist,
-			).Send(mlogFetcher)
-		}
-		glog.V(logger.Debug).Infof("Peer %s: discarded block #%d [%s], distance %d", peer, block.NumberU64(), hash.Hex(), dist)
-		metrics.FetchBroadcastDrops.Mark(1)
-		f.forgetHash(hash)
-		return
-	}
-	// Don't queue block if we already have it.
-	if f.getBlock(hash) != nil {
-		glog.V(logger.Debug).Infof("Peer %s: discarded block #%d [%s], already have", peer, block.NumberU64(), hash.Hex())
-		metrics.FetchBroadcastDrops.Mark(1)
+		log.Debug("Discarded propagated block, too far away", "peer", peer, "number", block.Number(), "hash", hash, "distance", dist)
+		propBroadcastDropMeter.Mark(1)
 		f.forgetHash(hash)
 		return
 	}
@@ -680,9 +628,7 @@ func (f *Fetcher) enqueue(peer string, block *types.Block) {
 		if f.queueChangeHook != nil {
 			f.queueChangeHook(op.block.Hash(), true)
 		}
-		if glog.V(logger.Debug) {
-			glog.Infof("Peer %s: queued block #%d [%s], total %v", peer, block.NumberU64(), hash.Hex(), f.queue.Size())
-		}
+		log.Debug("Queued propagated block", "peer", peer, "number", block.Number(), "hash", hash, "queued", f.queue.Size())
 	}
 }
 
@@ -693,43 +639,39 @@ func (f *Fetcher) insert(peer string, block *types.Block) {
 	hash := block.Hash()
 
 	// Run the import on a new thread
-	glog.V(logger.Debug).Infof("Peer %s: importing block #%d [%s]", peer, block.NumberU64(), hash.Hex())
+	log.Debug("Importing propagated block", "peer", peer, "number", block.Number(), "hash", hash)
 	go func() {
 		defer func() { f.done <- hash }()
 
-		// If the parent's unknown, abort insertion, and don't forget the hash and block;
-		// use queue gap fill to get unknown parent.
+		// If the parent's unknown, abort insertion
 		parent := f.getBlock(block.ParentHash())
 		if parent == nil {
-			glog.V(logger.Debug).Infof("Peer %s: parent [%s] of block #%d [%s] unknown", peer, block.ParentHash().Hex(), block.NumberU64(), hash.Hex())
+			log.Debug("Unknown parent of propagated block", "peer", peer, "number", block.Number(), "hash", hash, "parent", block.ParentHash())
 			return
 		}
 		// Quickly validate the header and propagate the block if it passes
 		switch err := f.verifyHeader(block.Header()); err {
 		case nil:
 			// All ok, quickly propagate to our peers
-			metrics.FetchBroadcastTimer.UpdateSince(block.ReceivedAt)
+			propBroadcastOutTimer.UpdateSince(block.ReceivedAt)
 			go f.broadcastBlock(block, true)
 
-		case core.BlockFutureErr:
+		case consensus.ErrFutureBlock:
 			// Weird future block, don't fail, but neither propagate
 
 		default:
 			// Something went very wrong, drop the peer
-			glog.V(logger.Debug).Infof("Peer %s: block #%d [%s] verification failed: %v", peer, block.NumberU64(), hash.Hex(), err)
+			log.Debug("Propagated block verification failed", "peer", peer, "number", block.Number(), "hash", hash, "err", err)
 			f.dropPeer(peer)
 			return
 		}
 		// Run the actual import and log any issues
-		if res := f.insertChain(types.Blocks{block}); res.Error != nil {
-			glog.V(logger.Warn).Infof("Peer %s: block #%d [%s] import failed: %v", peer, block.NumberU64(), hash.Hex(), res.Error)
-			glog.D(logger.Warn).Warnf("Peer %s: block #%d [%s] import failed: %v", peer, block.NumberU64(), hash.Hex(), res.Error)
+		if _, err := f.insertChain(types.Blocks{block}); err != nil {
+			log.Debug("Propagated block import failed", "peer", peer, "number", block.Number(), "hash", hash, "err", err)
 			return
-		} else {
-			f.mux.Post(FetcherInsertBlockEvent{Peer: peer, Block: block})
 		}
 		// If import succeeded, broadcast the block
-		metrics.FetchAnnounceTimer.UpdateSince(block.ReceivedAt)
+		propAnnounceOutTimer.UpdateSince(block.ReceivedAt)
 		go f.broadcastBlock(block, false)
 
 		// Invoke the testing hook if needed

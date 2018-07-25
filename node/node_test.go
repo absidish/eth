@@ -18,31 +18,25 @@ package node
 
 import (
 	"errors"
+	"io/ioutil"
+	"os"
 	"reflect"
 	"testing"
 	"time"
 
-	"github.com/ethereumproject/go-ethereum/crypto"
-	"github.com/ethereumproject/go-ethereum/logger/glog"
-	"github.com/ethereumproject/go-ethereum/p2p"
-	"github.com/ethereumproject/go-ethereum/rpc"
-	"github.com/spf13/afero"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/p2p"
+	"github.com/ethereum/go-ethereum/rpc"
 )
 
 var (
 	testNodeKey, _ = crypto.GenerateKey()
 )
 
-func init() {
-	glog.SetD(0)
-	glog.SetV(0)
-}
-
 func testNodeConfig() *Config {
 	return &Config{
-		PrivateKey: testNodeKey,
-		Name:       "test node",
-		fs:         &fs{afero.NewMemMapFs()},
+		Name: "test node",
+		P2P:  p2p.Config{PrivateKey: testNodeKey},
 	}
 }
 
@@ -82,16 +76,15 @@ func TestNodeLifeCycle(t *testing.T) {
 
 // Tests that if the data dir is already in use, an appropriate error is returned.
 func TestNodeUsedDataDir(t *testing.T) {
-	afs := afero.NewMemMapFs()
 	// Create a temporary folder to use as the data directory
-	dir, err := afero.TempDir(afs, "", "")
+	dir, err := ioutil.TempDir("", "")
 	if err != nil {
 		t.Fatalf("failed to create temporary data directory: %v", err)
 	}
-	defer afs.RemoveAll(dir)
+	defer os.RemoveAll(dir)
 
 	// Create a new node based on the data directory
-	original, err := New(&Config{DataDir: dir, fs: &fs{afs}})
+	original, err := New(&Config{DataDir: dir})
 	if err != nil {
 		t.Fatalf("failed to create original protocol stack: %v", err)
 	}
@@ -101,7 +94,7 @@ func TestNodeUsedDataDir(t *testing.T) {
 	defer original.Stop()
 
 	// Create a second node based on the same data directory and ensure failure
-	duplicate, err := New(&Config{DataDir: dir, fs: &fs{afs}})
+	duplicate, err := New(&Config{DataDir: dir})
 	if err != nil {
 		t.Fatalf("failed to create duplicate protocol stack: %v", err)
 	}
@@ -225,7 +218,7 @@ func TestServiceRestarts(t *testing.T) {
 	}
 	defer stack.Stop()
 
-	if running != true || started != 1 {
+	if !running || started != 1 {
 		t.Fatalf("running/started mismatch: have %v/%d, want true/1", running, started)
 	}
 	// Restart the stack a few times and check successful service restarts
@@ -234,7 +227,7 @@ func TestServiceRestarts(t *testing.T) {
 			t.Fatalf("iter %d: failed to restart stack: %v", i, err)
 		}
 	}
-	if running != true || started != 4 {
+	if !running || started != 4 {
 		t.Fatalf("running/started mismatch: have %v/%d, want true/4", running, started)
 	}
 }
@@ -514,41 +507,27 @@ func TestAPIGather(t *testing.T) {
 	}
 	// Register a batch of services with some configured APIs
 	calls := make(chan string, 1)
-
+	makeAPI := func(result string) *OneMethodAPI {
+		return &OneMethodAPI{fun: func() { calls <- result }}
+	}
 	services := map[string]struct {
 		APIs  []rpc.API
 		Maker InstrumentingWrapper
 	}{
-		"Zero APIs": {[]rpc.API{}, InstrumentedServiceMakerA},
-		"Single API": {[]rpc.API{
-			{
-				Namespace: "single",
-				Version:   "1",
-				Service:   &OneMethodApi{fun: func() { calls <- "single.v1" }},
-				Public:    true,
-			},
-		}, InstrumentedServiceMakerB},
-		"Many APIs": {[]rpc.API{
-			{
-				Namespace: "multi",
-				Version:   "1",
-				Service:   &OneMethodApi{fun: func() { calls <- "multi.v1" }},
-				Public:    true,
-			},
-			{
-				Namespace: "multi.v2",
-				Version:   "2",
-				Service:   &OneMethodApi{fun: func() { calls <- "multi.v2" }},
-				Public:    true,
-			},
-			{
-				Namespace: "multi.v2.nested",
-				Version:   "2",
-				Service:   &OneMethodApi{fun: func() { calls <- "multi.v2.nested" }},
-				Public:    true,
-			},
-		}, InstrumentedServiceMakerC},
+		"Zero APIs": {
+			[]rpc.API{}, InstrumentedServiceMakerA},
+		"Single API": {
+			[]rpc.API{
+				{Namespace: "single", Version: "1", Service: makeAPI("single.v1"), Public: true},
+			}, InstrumentedServiceMakerB},
+		"Many APIs": {
+			[]rpc.API{
+				{Namespace: "multi", Version: "1", Service: makeAPI("multi.v1"), Public: true},
+				{Namespace: "multi.v2", Version: "2", Service: makeAPI("multi.v2"), Public: true},
+				{Namespace: "multi.v2.nested", Version: "2", Service: makeAPI("multi.v2.nested"), Public: true},
+			}, InstrumentedServiceMakerC},
 	}
+
 	for id, config := range services {
 		config := config
 		constructor := func(*ServiceContext) (Service, error) {
@@ -581,12 +560,8 @@ func TestAPIGather(t *testing.T) {
 		{"multi.v2.nested_theOneMethod", "multi.v2.nested"},
 	}
 	for i, test := range tests {
-		if err := client.Send(rpc.JSONRequest{Id: []byte("1"), Version: "2.0", Method: test.Method}); err != nil {
-			t.Fatalf("test %d: failed to send API request: %v", i, err)
-		}
-		reply := new(rpc.JSONResponse)
-		if err := client.Recv(reply); err != nil {
-			t.Fatalf("test %d: failed to read API reply: %v", i, err)
+		if err := client.Call(nil, test.Method); err != nil {
+			t.Errorf("test %d: API request failed: %v", i, err)
 		}
 		select {
 		case result := <-calls:
